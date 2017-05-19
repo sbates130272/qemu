@@ -10,3 +10,8 @@ virtio_blk_submit_multireq(void *mrb, int start, int num_reqs, uint64_t offset, 
 # hw/block/hd-geometry.c
 hd_geometry_lchs_guess(void *blk, int cyls, int heads, int secs) "blk %p LCHS %d %d %d"
 hd_geometry_guess(void *blk, uint32_t cyls, uint32_t heads, uint32_t secs, int trans) "blk %p CHS %u %u %u trans %d"
+
+# hw/block/nvme.c
+nvme_io(uint64_t addr) "%"PRIx64
+nvme_cmb_io(uint64_t addr) "%"PRIx64
+nvme_map_prp(uint64_t addr, uint32_t cmbsz, unsigned start, unsigned end) "prp1 %"PRIx64" cmbsz %d ctrl_mem.start %zu ctrl_mem.end %zu"

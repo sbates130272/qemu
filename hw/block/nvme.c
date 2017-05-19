@@ -33,6 +33,7 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "sysemu/block-backend.h"
+#include "trace.h"
 
 #include "nvme.h"
 
@@ -99,6 +100,9 @@ static uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
     hwaddr trans_len = n->page_size - (prp1 % n->page_size);
     trans_len = MIN(len, trans_len);
     int num_prps = (len >> n->page_bits) + 1;
+
+    trace_nvme_map_prp(prp1, n->cmbsz, n->ctrl_mem.addr,
+                       n->ctrl_mem.addr + int128_get64(n->ctrl_mem.size));
 
     if (!prp1) {
         return NVME_INVALID_FIELD | NVME_DNR;
@@ -311,10 +315,9 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         return NVME_INVALID_FIELD | NVME_DNR;
     }
 
-    assert((nlb << data_shift) == req->qsg.size);
-
     dma_acct_start(n->conf.blk, &req->acct, &req->qsg, acct);
     if (req->qsg.nsg > 0) {
+        trace_nvme_io(prp1);
         req->has_sg = true;
         req->aiocb = is_write ?
             dma_blk_write(n->conf.blk, &req->qsg, data_offset, BDRV_SECTOR_SIZE,
@@ -322,6 +325,7 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             dma_blk_read(n->conf.blk, &req->qsg, data_offset, BDRV_SECTOR_SIZE,
                          nvme_rw_cb, req);
     } else {
+        trace_nvme_cmb_io(prp1);
         req->has_sg = false;
         req->aiocb = is_write ?
             blk_aio_pwritev(n->conf.blk, data_offset, &req->iov, 0, nvme_rw_cb,
@@ -1021,6 +1025,9 @@ static int nvme_init(PCIDevice *pci_dev)
         NVME_CMBSZ_SET_WDS(n->bar.cmbsz, 1);
         NVME_CMBSZ_SET_SZU(n->bar.cmbsz, 2); /* MBs */
         NVME_CMBSZ_SET_SZ(n->bar.cmbsz, n->cmb_size_mb);
+
+        n->cmbloc = n->bar.cmbloc;
+        n->cmbsz = n->bar.cmbsz;
 
         n->cmbuf = g_malloc0(NVME_CMBSZ_GETSIZE(n->bar.cmbsz));
         memory_region_init_io(&n->ctrl_mem, OBJECT(n), &nvme_cmb_ops, n,
