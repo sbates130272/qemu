@@ -1,5 +1,5 @@
 /*
- * QEMU educational PCI device
+ * QEMU BPF-capable PCI device
  *
  * Copyright (c) 2012-2015 Jiri Slaby
  *
@@ -30,8 +30,8 @@
 #include "qemu/main-loop.h" /* iothread mutex */
 #include "qapi/visitor.h"
 
-#define TYPE_PCI_EDU_DEVICE "pcie-ubpf"
-#define EDU(obj)        OBJECT_CHECK(EduState, obj, TYPE_PCI_EDU_DEVICE)
+#define TYPE_PCI_BPF_DEVICE "pcie-ubpf"
+#define BPF(obj)        OBJECT_CHECK(BpfState, obj, TYPE_PCI_BPF_DEVICE)
 
 #define FACT_IRQ        0x00000001
 #define DMA_IRQ         0x00000100
@@ -50,17 +50,17 @@ typedef struct {
 
     uint32_t addr4;
     uint32_t fact;
-#define EDU_STATUS_COMPUTING    0x01
-#define EDU_STATUS_IRQFACT      0x80
+#define BPF_STATUS_COMPUTING    0x01
+#define BPF_STATUS_IRQFACT      0x80
     uint32_t status;
 
     uint32_t irq_status;
 
-#define EDU_DMA_RUN             0x1
-#define EDU_DMA_DIR(cmd)        (((cmd) & 0x2) >> 1)
-# define EDU_DMA_FROM_PCI       0
-# define EDU_DMA_TO_PCI         1
-#define EDU_DMA_IRQ             0x4
+#define BPF_DMA_RUN             0x1
+#define BPF_DMA_DIR(cmd)        (((cmd) & 0x2) >> 1)
+# define BPF_DMA_FROM_PCI       0
+# define BPF_DMA_TO_PCI         1
+#define BPF_DMA_IRQ             0x4
     struct dma_state {
         dma_addr_t src;
         dma_addr_t dst;
@@ -70,31 +70,31 @@ typedef struct {
     QEMUTimer dma_timer;
     char dma_buf[DMA_SIZE];
     uint64_t dma_mask;
-} EduState;
+} BpfState;
 
-static bool edu_msi_enabled(EduState *edu)
+static bool bpf_msi_enabled(BpfState *bpf)
 {
-    return msi_enabled(&edu->pdev);
+    return msi_enabled(&bpf->pdev);
 }
 
-static void edu_raise_irq(EduState *edu, uint32_t val)
+static void bpf_raise_irq(BpfState *bpf, uint32_t val)
 {
-    edu->irq_status |= val;
-    if (edu->irq_status) {
-        if (edu_msi_enabled(edu)) {
-            msi_notify(&edu->pdev, 0);
+    bpf->irq_status |= val;
+    if (bpf->irq_status) {
+        if (bpf_msi_enabled(bpf)) {
+            msi_notify(&bpf->pdev, 0);
         } else {
-            pci_set_irq(&edu->pdev, 1);
+            pci_set_irq(&bpf->pdev, 1);
         }
     }
 }
 
-static void edu_lower_irq(EduState *edu, uint32_t val)
+static void bpf_lower_irq(BpfState *bpf, uint32_t val)
 {
-    edu->irq_status &= ~val;
+    bpf->irq_status &= ~val;
 
-    if (!edu->irq_status && !edu_msi_enabled(edu)) {
-        pci_set_irq(&edu->pdev, 0);
+    if (!bpf->irq_status && !bpf_msi_enabled(bpf)) {
+        pci_set_irq(&bpf->pdev, 0);
     }
 }
 
@@ -103,7 +103,7 @@ static bool within(uint32_t addr, uint32_t start, uint32_t end)
     return start <= addr && addr < end;
 }
 
-static void edu_check_range(uint32_t addr, uint32_t size1, uint32_t start,
+static void bpf_check_range(uint32_t addr, uint32_t size1, uint32_t start,
                 uint32_t size2)
 {
     uint32_t end1 = addr + size1;
@@ -114,58 +114,58 @@ static void edu_check_range(uint32_t addr, uint32_t size1, uint32_t start,
         return;
     }
 
-    hw_error("EDU: DMA range 0x%.8x-0x%.8x out of bounds (0x%.8x-0x%.8x)!",
+    hw_error("BPF: DMA range 0x%.8x-0x%.8x out of bounds (0x%.8x-0x%.8x)!",
             addr, end1 - 1, start, end2 - 1);
 }
 
-static dma_addr_t edu_clamp_addr(const EduState *edu, dma_addr_t addr)
+static dma_addr_t bpf_clamp_addr(const BpfState *bpf, dma_addr_t addr)
 {
-    dma_addr_t res = addr & edu->dma_mask;
+    dma_addr_t res = addr & bpf->dma_mask;
 
     if (addr != res) {
-        printf("EDU: clamping DMA %#.16"PRIx64" to %#.16"PRIx64"!\n", addr, res);
+        printf("BPF: clamping DMA %#.16"PRIx64" to %#.16"PRIx64"!\n", addr, res);
     }
 
     return res;
 }
 
-static void edu_dma_timer(void *opaque)
+static void bpf_dma_timer(void *opaque)
 {
-    EduState *edu = opaque;
+    BpfState *bpf = opaque;
     bool raise_irq = false;
 
-    if (!(edu->dma.cmd & EDU_DMA_RUN)) {
+    if (!(bpf->dma.cmd & BPF_DMA_RUN)) {
         return;
     }
 
-    if (EDU_DMA_DIR(edu->dma.cmd) == EDU_DMA_FROM_PCI) {
-        uint32_t dst = edu->dma.dst;
-        edu_check_range(dst, edu->dma.cnt, DMA_START, DMA_SIZE);
+    if (BPF_DMA_DIR(bpf->dma.cmd) == BPF_DMA_FROM_PCI) {
+        uint32_t dst = bpf->dma.dst;
+        bpf_check_range(dst, bpf->dma.cnt, DMA_START, DMA_SIZE);
         dst -= DMA_START;
-        pci_dma_read(&edu->pdev, edu_clamp_addr(edu, edu->dma.src),
-                edu->dma_buf + dst, edu->dma.cnt);
+        pci_dma_read(&bpf->pdev, bpf_clamp_addr(bpf, bpf->dma.src),
+                bpf->dma_buf + dst, bpf->dma.cnt);
     } else {
-        uint32_t src = edu->dma.src;
-        edu_check_range(src, edu->dma.cnt, DMA_START, DMA_SIZE);
+        uint32_t src = bpf->dma.src;
+        bpf_check_range(src, bpf->dma.cnt, DMA_START, DMA_SIZE);
         src -= DMA_START;
-        pci_dma_write(&edu->pdev, edu_clamp_addr(edu, edu->dma.dst),
-                edu->dma_buf + src, edu->dma.cnt);
+        pci_dma_write(&bpf->pdev, bpf_clamp_addr(bpf, bpf->dma.dst),
+                bpf->dma_buf + src, bpf->dma.cnt);
     }
 
-    edu->dma.cmd &= ~EDU_DMA_RUN;
-    if (edu->dma.cmd & EDU_DMA_IRQ) {
+    bpf->dma.cmd &= ~BPF_DMA_RUN;
+    if (bpf->dma.cmd & BPF_DMA_IRQ) {
         raise_irq = true;
     }
 
     if (raise_irq) {
-        edu_raise_irq(edu, DMA_IRQ);
+        bpf_raise_irq(bpf, DMA_IRQ);
     }
 }
 
-static void dma_rw(EduState *edu, bool write, dma_addr_t *val, dma_addr_t *dma,
+static void dma_rw(BpfState *bpf, bool write, dma_addr_t *val, dma_addr_t *dma,
                 bool timer)
 {
-    if (write && (edu->dma.cmd & EDU_DMA_RUN)) {
+    if (write && (bpf->dma.cmd & BPF_DMA_RUN)) {
         return;
     }
 
@@ -176,13 +176,13 @@ static void dma_rw(EduState *edu, bool write, dma_addr_t *val, dma_addr_t *dma,
     }
 
     if (timer) {
-        timer_mod(&edu->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+        timer_mod(&bpf->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
     }
 }
 
-static uint64_t edu_mmio_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
-    EduState *edu = opaque;
+    BpfState *bpf = opaque;
     uint64_t val = ~0ULL;
 
     if (size != 4) {
@@ -191,43 +191,43 @@ static uint64_t edu_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
     case 0x00:
-        val = 0x010000edu;
+        val = 0x010000;
         break;
     case 0x04:
-        val = edu->addr4;
+        val = bpf->addr4;
         break;
     case 0x08:
-        qemu_mutex_lock(&edu->thr_mutex);
-        val = edu->fact;
-        qemu_mutex_unlock(&edu->thr_mutex);
+        qemu_mutex_lock(&bpf->thr_mutex);
+        val = bpf->fact;
+        qemu_mutex_unlock(&bpf->thr_mutex);
         break;
     case 0x20:
-        val = atomic_read(&edu->status);
+        val = atomic_read(&bpf->status);
         break;
     case 0x24:
-        val = edu->irq_status;
+        val = bpf->irq_status;
         break;
     case 0x80:
-        dma_rw(edu, false, &val, &edu->dma.src, false);
+        dma_rw(bpf, false, &val, &bpf->dma.src, false);
         break;
     case 0x88:
-        dma_rw(edu, false, &val, &edu->dma.dst, false);
+        dma_rw(bpf, false, &val, &bpf->dma.dst, false);
         break;
     case 0x90:
-        dma_rw(edu, false, &val, &edu->dma.cnt, false);
+        dma_rw(bpf, false, &val, &bpf->dma.cnt, false);
         break;
     case 0x98:
-        dma_rw(edu, false, &val, &edu->dma.cmd, false);
+        dma_rw(bpf, false, &val, &bpf->dma.cmd, false);
         break;
     }
 
     return val;
 }
 
-static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                 unsigned size)
 {
-    EduState *edu = opaque;
+    BpfState *bpf = opaque;
 
     if (addr < 0x80 && size != 4) {
         return;
@@ -239,55 +239,55 @@ static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case 0x04:
-        edu->addr4 = ~val;
+        bpf->addr4 = ~val;
         break;
     case 0x08:
-        if (atomic_read(&edu->status) & EDU_STATUS_COMPUTING) {
+        if (atomic_read(&bpf->status) & BPF_STATUS_COMPUTING) {
             break;
         }
-        /* EDU_STATUS_COMPUTING cannot go 0->1 concurrently, because it is only
+        /* BPF_STATUS_COMPUTING cannot go 0->1 concurrently, because it is only
          * set in this function and it is under the iothread mutex.
          */
-        qemu_mutex_lock(&edu->thr_mutex);
-        edu->fact = val;
-        atomic_or(&edu->status, EDU_STATUS_COMPUTING);
-        qemu_cond_signal(&edu->thr_cond);
-        qemu_mutex_unlock(&edu->thr_mutex);
+        qemu_mutex_lock(&bpf->thr_mutex);
+        bpf->fact = val;
+        atomic_or(&bpf->status, BPF_STATUS_COMPUTING);
+        qemu_cond_signal(&bpf->thr_cond);
+        qemu_mutex_unlock(&bpf->thr_mutex);
         break;
     case 0x20:
-        if (val & EDU_STATUS_IRQFACT) {
-            atomic_or(&edu->status, EDU_STATUS_IRQFACT);
+        if (val & BPF_STATUS_IRQFACT) {
+            atomic_or(&bpf->status, BPF_STATUS_IRQFACT);
         } else {
-            atomic_and(&edu->status, ~EDU_STATUS_IRQFACT);
+            atomic_and(&bpf->status, ~BPF_STATUS_IRQFACT);
         }
         break;
     case 0x60:
-        edu_raise_irq(edu, val);
+        bpf_raise_irq(bpf, val);
         break;
     case 0x64:
-        edu_lower_irq(edu, val);
+        bpf_lower_irq(bpf, val);
         break;
     case 0x80:
-        dma_rw(edu, true, &val, &edu->dma.src, false);
+        dma_rw(bpf, true, &val, &bpf->dma.src, false);
         break;
     case 0x88:
-        dma_rw(edu, true, &val, &edu->dma.dst, false);
+        dma_rw(bpf, true, &val, &bpf->dma.dst, false);
         break;
     case 0x90:
-        dma_rw(edu, true, &val, &edu->dma.cnt, false);
+        dma_rw(bpf, true, &val, &bpf->dma.cnt, false);
         break;
     case 0x98:
-        if (!(val & EDU_DMA_RUN)) {
+        if (!(val & BPF_DMA_RUN)) {
             break;
         }
-        dma_rw(edu, true, &val, &edu->dma.cmd, true);
+        dma_rw(bpf, true, &val, &bpf->dma.cmd, true);
         break;
     }
 }
 
-static const MemoryRegionOps edu_mmio_ops = {
-    .read = edu_mmio_read,
-    .write = edu_mmio_write,
+static const MemoryRegionOps bpf_mmio_ops = {
+    .read = bpf_mmio_read,
+    .write = bpf_mmio_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -295,26 +295,26 @@ static const MemoryRegionOps edu_mmio_ops = {
  * We purposely use a thread, so that users are forced to wait for the status
  * register.
  */
-static void *edu_fact_thread(void *opaque)
+static void *bpf_fact_thread(void *opaque)
 {
-    EduState *edu = opaque;
+    BpfState *bpf = opaque;
 
     while (1) {
         uint32_t val, ret = 1;
 
-        qemu_mutex_lock(&edu->thr_mutex);
-        while ((atomic_read(&edu->status) & EDU_STATUS_COMPUTING) == 0 &&
-                        !edu->stopping) {
-            qemu_cond_wait(&edu->thr_cond, &edu->thr_mutex);
+        qemu_mutex_lock(&bpf->thr_mutex);
+        while ((atomic_read(&bpf->status) & BPF_STATUS_COMPUTING) == 0 &&
+                        !bpf->stopping) {
+            qemu_cond_wait(&bpf->thr_cond, &bpf->thr_mutex);
         }
 
-        if (edu->stopping) {
-            qemu_mutex_unlock(&edu->thr_mutex);
+        if (bpf->stopping) {
+            qemu_mutex_unlock(&bpf->thr_mutex);
             break;
         }
 
-        val = edu->fact;
-        qemu_mutex_unlock(&edu->thr_mutex);
+        val = bpf->fact;
+        qemu_mutex_unlock(&bpf->thr_mutex);
 
         while (val > 0) {
             ret *= val--;
@@ -325,14 +325,14 @@ static void *edu_fact_thread(void *opaque)
          * forced to check the status properly.
          */
 
-        qemu_mutex_lock(&edu->thr_mutex);
-        edu->fact = ret;
-        qemu_mutex_unlock(&edu->thr_mutex);
-        atomic_and(&edu->status, ~EDU_STATUS_COMPUTING);
+        qemu_mutex_lock(&bpf->thr_mutex);
+        bpf->fact = ret;
+        qemu_mutex_unlock(&bpf->thr_mutex);
+        atomic_and(&bpf->status, ~BPF_STATUS_COMPUTING);
 
-        if (atomic_read(&edu->status) & EDU_STATUS_IRQFACT) {
+        if (atomic_read(&bpf->status) & BPF_STATUS_IRQFACT) {
             qemu_mutex_lock_iothread();
-            edu_raise_irq(edu, FACT_IRQ);
+            bpf_raise_irq(bpf, FACT_IRQ);
             qemu_mutex_unlock_iothread();
         }
     }
@@ -340,9 +340,9 @@ static void *edu_fact_thread(void *opaque)
     return NULL;
 }
 
-static void pci_edu_realize(PCIDevice *pdev, Error **errp)
+static void pci_bpf_realize(PCIDevice *pdev, Error **errp)
 {
-    EduState *edu = EDU(pdev);
+    BpfState *bpf = BPF(pdev);
     uint8_t *pci_conf = pdev->config;
 
     pci_config_set_interrupt_pin(pci_conf, 1);
@@ -351,35 +351,35 @@ static void pci_edu_realize(PCIDevice *pdev, Error **errp)
         return;
     }
 
-    timer_init_ms(&edu->dma_timer, QEMU_CLOCK_VIRTUAL, edu_dma_timer, edu);
+    timer_init_ms(&bpf->dma_timer, QEMU_CLOCK_VIRTUAL, bpf_dma_timer, bpf);
 
-    qemu_mutex_init(&edu->thr_mutex);
-    qemu_cond_init(&edu->thr_cond);
-    qemu_thread_create(&edu->thread, "edu", edu_fact_thread,
-                       edu, QEMU_THREAD_JOINABLE);
+    qemu_mutex_init(&bpf->thr_mutex);
+    qemu_cond_init(&bpf->thr_cond);
+    qemu_thread_create(&bpf->thread, "bpf", bpf_fact_thread,
+                       bpf, QEMU_THREAD_JOINABLE);
 
-    memory_region_init_io(&edu->mmio, OBJECT(edu), &edu_mmio_ops, edu,
-                    "edu-mmio", 1 * MiB);
-    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &edu->mmio);
+    memory_region_init_io(&bpf->mmio, OBJECT(bpf), &bpf_mmio_ops, bpf,
+                    "bpf-mmio", 1 * MiB);
+    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &bpf->mmio);
 }
 
-static void pci_edu_uninit(PCIDevice *pdev)
+static void pci_bpf_uninit(PCIDevice *pdev)
 {
-    EduState *edu = EDU(pdev);
+    BpfState *bpf = BPF(pdev);
 
-    qemu_mutex_lock(&edu->thr_mutex);
-    edu->stopping = true;
-    qemu_mutex_unlock(&edu->thr_mutex);
-    qemu_cond_signal(&edu->thr_cond);
-    qemu_thread_join(&edu->thread);
+    qemu_mutex_lock(&bpf->thr_mutex);
+    bpf->stopping = true;
+    qemu_mutex_unlock(&bpf->thr_mutex);
+    qemu_cond_signal(&bpf->thr_cond);
+    qemu_thread_join(&bpf->thread);
 
-    qemu_cond_destroy(&edu->thr_cond);
-    qemu_mutex_destroy(&edu->thr_mutex);
+    qemu_cond_destroy(&bpf->thr_cond);
+    qemu_mutex_destroy(&bpf->thr_mutex);
 
-    timer_del(&edu->dma_timer);
+    timer_del(&bpf->dma_timer);
 }
 
-static void edu_obj_uint64(Object *obj, Visitor *v, const char *name,
+static void bpf_obj_uint64(Object *obj, Visitor *v, const char *name,
                            void *opaque, Error **errp)
 {
     uint64_t *val = opaque;
@@ -387,42 +387,42 @@ static void edu_obj_uint64(Object *obj, Visitor *v, const char *name,
     visit_type_uint64(v, name, val, errp);
 }
 
-static void edu_instance_init(Object *obj)
+static void bpf_instance_init(Object *obj)
 {
-    EduState *edu = EDU(obj);
+    BpfState *bpf = BPF(obj);
 
-    edu->dma_mask = (1UL << 28) - 1;
-    object_property_add(obj, "dma_mask", "uint64", edu_obj_uint64,
-                    edu_obj_uint64, NULL, &edu->dma_mask, NULL);
+    bpf->dma_mask = (1UL << 28) - 1;
+    object_property_add(obj, "dma_mask", "uint64", bpf_obj_uint64,
+                    bpf_obj_uint64, NULL, &bpf->dma_mask, NULL);
 }
 
-static void edu_class_init(ObjectClass *class, void *data)
+static void bpf_class_init(ObjectClass *class, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(class);
 
-    k->realize = pci_edu_realize;
-    k->exit = pci_edu_uninit;
-    k->vendor_id = PCI_VENDOR_ID_QEMU;
-    k->device_id = 0x11e8;
+    k->realize = pci_bpf_realize;
+    k->exit = pci_bpf_uninit;
+    k->vendor_id = 0x1de5; /* Eideticom */
+    k->device_id = 0x3000;
     k->revision = 0x10;
     k->class_id = PCI_CLASS_OTHERS;
 }
 
-static void pci_edu_register_types(void)
+static void pci_bpf_register_types(void)
 {
     static InterfaceInfo interfaces[] = {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     };
-    static const TypeInfo edu_info = {
-        .name          = TYPE_PCI_EDU_DEVICE,
+    static const TypeInfo bpf_info = {
+        .name          = TYPE_PCI_BPF_DEVICE,
         .parent        = TYPE_PCI_DEVICE,
-        .instance_size = sizeof(EduState),
-        .instance_init = edu_instance_init,
-        .class_init    = edu_class_init,
+        .instance_size = sizeof(BpfState),
+        .instance_init = bpf_instance_init,
+        .class_init    = bpf_class_init,
         .interfaces = interfaces,
     };
 
-    type_register_static(&edu_info);
+    type_register_static(&bpf_info);
 }
-type_init(pci_edu_register_types)
+type_init(pci_bpf_register_types)
