@@ -484,6 +484,7 @@ docker="no"
 debug_mutex="no"
 libpmem=""
 libudev="no"
+libubpf=""
 
 # cross compilers defaults, can be overridden with --cross-cc-ARCH
 cross_cc_aarch64="aarch64-linux-gnu-gcc"
@@ -1490,6 +1491,10 @@ for opt do
   --enable-libpmem) libpmem=yes
   ;;
   --disable-libpmem) libpmem=no
+  ;;
+  --disable-libubpf) libubpf="no"
+  ;;
+  --enable-libubpf) libubpf="yes"
   ;;
   *)
       echo "ERROR: unknown option $opt"
@@ -3778,6 +3783,25 @@ EOF
       feature_not_found "linux AIO" "Install libaio devel"
     fi
     linux_aio=no
+  fi
+fi
+
+##########################################
+# libubpf probe
+
+if test "$libubpf" != "no" ; then
+  cat > $TMPC <<EOF
+#include <ubpf/ubpf.h>
+#include <ubpf/ubpf_int.h>
+int main(void) { ubpf_create(); return 0; }
+EOF
+  if compile_prog "" "-lubpf" ; then
+    libubpf=yes
+  else
+    if test "$libubpf" = "yes" ; then
+      feature_not_found "libubpf" "Install libubpf"
+    fi
+    libubpf=no
   fi
 fi
 
@@ -6110,6 +6134,7 @@ echo "capstone          $capstone"
 echo "docker            $docker"
 echo "libpmem support   $libpmem"
 echo "libudev           $libudev"
+echo "libubpf           $libubpf"
 
 if test "$sdl_too_old" = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"
@@ -6493,6 +6518,9 @@ if test "$xen" = "yes" ; then
 fi
 if test "$linux_aio" = "yes" ; then
   echo "CONFIG_LINUX_AIO=y" >> $config_host_mak
+fi
+if test "$libubpf" = "yes" ; then
+  echo "CONFIG_LIBUBPF=y" >> $config_host_mak
 fi
 if test "$attr" = "yes" ; then
   echo "CONFIG_ATTR=y" >> $config_host_mak
