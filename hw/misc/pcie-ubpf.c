@@ -372,7 +372,7 @@ static void pci_bpf_realize(PCIDevice *pdev, Error **errp)
                     "bpf-mmio", 1 * MiB);
     memory_region_add_subregion_overlap(&bpf->bpf_bar, 0x0, &bpf->bpf_ram, 1);
     memory_region_add_subregion_overlap(&bpf->bpf_bar, 1 * MiB, &bpf->bpf_mmio, 2);
-    pci_register_bar(pdev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY, &bpf->bpf_bar);
+    pci_register_bar(pdev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_PREFETCH, &bpf->bpf_bar);
 }
 
 static void pci_bpf_uninit(PCIDevice *pdev)
