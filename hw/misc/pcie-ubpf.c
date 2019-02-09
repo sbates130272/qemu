@@ -29,6 +29,8 @@
 #include "qemu/timer.h"
 #include "qemu/main-loop.h" /* iothread mutex */
 #include "qapi/visitor.h"
+#include "qapi/error.h"
+#include <ubpf/ubpf.h>
 
 #define TYPE_PCI_BPF_DEVICE "pcie-ubpf"
 #define BPF(obj)        OBJECT_CHECK(BpfState, obj, TYPE_PCI_BPF_DEVICE)
@@ -39,9 +41,18 @@
 #define DMA_START       0x40000
 #define DMA_SIZE        4096
 
+#define EBPF_PROG_LEN_OFFSET    0x0
+#define EBPF_PROG_OFFSET        0x1000
+#define EBPF_RET_OFFSET         0x200000
+#define EBPF_START              0x1
+
 typedef struct {
     PCIDevice pdev;
-    MemoryRegion mmio;
+    MemoryRegion bpf_bar;
+    MemoryRegion bpf_ram;
+    MemoryRegion bpf_mmio;
+
+    bool running;
 
     QemuThread thread;
     QemuMutex thr_mutex;
@@ -70,6 +81,7 @@ typedef struct {
     QEMUTimer dma_timer;
     char dma_buf[DMA_SIZE];
     uint64_t dma_mask;
+    struct ubpf_vm *vm;
 } BpfState;
 
 static bool bpf_msi_enabled(BpfState *bpf)
@@ -86,15 +98,6 @@ static void bpf_raise_irq(BpfState *bpf, uint32_t val)
         } else {
             pci_set_irq(&bpf->pdev, 1);
         }
-    }
-}
-
-static void bpf_lower_irq(BpfState *bpf, uint32_t val)
-{
-    bpf->irq_status &= ~val;
-
-    if (!bpf->irq_status && !bpf_msi_enabled(bpf)) {
-        pci_set_irq(&bpf->pdev, 0);
     }
 }
 
@@ -224,64 +227,69 @@ static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
+static void bpf_start_program(BpfState *bpf)
+{
+    void *bpf_ram_ptr = memory_region_get_ram_ptr(&bpf->bpf_ram);
+    int32_t code_len = *((int32_t*) bpf_ram_ptr) + EBPF_PROG_LEN_OFFSET;
+    void* code = bpf_ram_ptr + EBPF_PROG_OFFSET;
+    char *errmsg;
+
+    bpf->vm = ubpf_create();
+    if (!bpf->vm) {
+        fprintf(stderr, "Failed to create VM\n");
+        return;
+    }
+
+    int32_t rv = ubpf_load(bpf->vm, code, code_len, &errmsg);
+    if (rv < 0) {
+        fprintf(stderr, "Failed to load code: %s\n", errmsg);
+        ubpf_destroy(bpf->vm);
+        bpf->vm = NULL;
+        free(errmsg);
+        return;
+    }
+
+    uint64_t ret = ubpf_exec(bpf->vm, NULL, 0);
+
+    uint64_t *ret_addr = (uint64_t*) (bpf_ram_ptr + EBPF_RET_OFFSET);
+    *ret_addr = ret;
+
+    ubpf_destroy(bpf->vm);
+    bpf->vm = NULL;
+}
+
+static void bpf_stop_program(BpfState *bpf)
+{
+    if (bpf->vm) {
+        ubpf_destroy(bpf->vm);
+        bpf->vm = NULL;
+    }
+}
+
 static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                 unsigned size)
 {
     BpfState *bpf = opaque;
 
-    if (addr < 0x80 && size != 4) {
-        return;
-    }
-
-    if (addr >= 0x80 && size != 4 && size != 8) {
-        return;
-    }
-
     switch (addr) {
-    case 0x04:
-        bpf->addr4 = ~val;
-        break;
-    case 0x08:
-        if (atomic_read(&bpf->status) & BPF_STATUS_COMPUTING) {
+        case 0x0:
+            if (val & EBPF_START) {
+                if (bpf->running) {
+                    bpf_stop_program(bpf);
+                }
+                bpf_start_program(bpf);
+                bpf->running = true;
+            }
+            else {
+                if (!bpf->running) {
+                    bpf_stop_program(bpf);
+                    bpf->running = false;
+                }
+            }
             break;
-        }
-        /* BPF_STATUS_COMPUTING cannot go 0->1 concurrently, because it is only
-         * set in this function and it is under the iothread mutex.
-         */
-        qemu_mutex_lock(&bpf->thr_mutex);
-        bpf->fact = val;
-        atomic_or(&bpf->status, BPF_STATUS_COMPUTING);
-        qemu_cond_signal(&bpf->thr_cond);
-        qemu_mutex_unlock(&bpf->thr_mutex);
-        break;
-    case 0x20:
-        if (val & BPF_STATUS_IRQFACT) {
-            atomic_or(&bpf->status, BPF_STATUS_IRQFACT);
-        } else {
-            atomic_and(&bpf->status, ~BPF_STATUS_IRQFACT);
-        }
-        break;
-    case 0x60:
-        bpf_raise_irq(bpf, val);
-        break;
-    case 0x64:
-        bpf_lower_irq(bpf, val);
-        break;
-    case 0x80:
-        dma_rw(bpf, true, &val, &bpf->dma.src, false);
-        break;
-    case 0x88:
-        dma_rw(bpf, true, &val, &bpf->dma.dst, false);
-        break;
-    case 0x90:
-        dma_rw(bpf, true, &val, &bpf->dma.cnt, false);
-        break;
-    case 0x98:
-        if (!(val & BPF_DMA_RUN)) {
+        default:
+            fprintf(stderr, "Invalid address (reserved) \n");
             break;
-        }
-        dma_rw(bpf, true, &val, &bpf->dma.cmd, true);
-        break;
     }
 }
 
@@ -358,9 +366,13 @@ static void pci_bpf_realize(PCIDevice *pdev, Error **errp)
     qemu_thread_create(&bpf->thread, "bpf", bpf_fact_thread,
                        bpf, QEMU_THREAD_JOINABLE);
 
-    memory_region_init_io(&bpf->mmio, OBJECT(bpf), &bpf_mmio_ops, bpf,
+    memory_region_init(&bpf->bpf_bar, OBJECT(bpf), "bpf-bar", 16 * MiB);
+    memory_region_init_ram(&bpf->bpf_ram, OBJECT(bpf), "bpf-ram", 16 * MiB, &error_fatal);
+    memory_region_init_io(&bpf->bpf_mmio, OBJECT(bpf), &bpf_mmio_ops, bpf,
                     "bpf-mmio", 1 * MiB);
-    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &bpf->mmio);
+    memory_region_add_subregion_overlap(&bpf->bpf_bar, 0x0, &bpf->bpf_ram, 1);
+    memory_region_add_subregion_overlap(&bpf->bpf_bar, 1 * MiB, &bpf->bpf_mmio, 2);
+    pci_register_bar(pdev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY, &bpf->bpf_bar);
 }
 
 static void pci_bpf_uninit(PCIDevice *pdev)
