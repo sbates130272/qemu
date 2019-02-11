@@ -31,6 +31,7 @@
 #include "qapi/visitor.h"
 #include "qapi/error.h"
 #include <ubpf/ubpf.h>
+#include <elf.h>
 
 #define TYPE_PCI_BPF_DEVICE "pcie-ubpf"
 #define BPF(obj)        OBJECT_CHECK(BpfState, obj, TYPE_PCI_BPF_DEVICE)
@@ -170,6 +171,8 @@ static int bpf_start_program(BpfState *bpf)
     int32_t code_len = *((int32_t*) bpf_ram_ptr) + EBPF_PROG_LEN_OFFSET;
     void* code = bpf_ram_ptr + EBPF_PROG_OFFSET;
     char *errmsg;
+    int32_t rv;
+    bool elf;
 
     bpf->vm = ubpf_create();
     if (!bpf->vm) {
@@ -177,7 +180,15 @@ static int bpf_start_program(BpfState *bpf)
         return 1;
     }
 
-    int32_t rv = ubpf_load(bpf->vm, code, code_len, &errmsg);
+    /* Check magic number (first 4 bytes) */
+    elf = code_len >= 4 && !memcmp(code, ELFMAG, 4);
+    if (elf) {
+        rv = ubpf_load_elf(bpf->vm, code, code_len, &errmsg);
+    }
+    else {
+        rv = ubpf_load(bpf->vm, code, code_len, &errmsg);
+    }
+
     if (rv < 0) {
         fprintf(stderr, "Failed to load code: %s\n", errmsg);
         ubpf_destroy(bpf->vm);
