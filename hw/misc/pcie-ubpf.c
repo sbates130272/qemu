@@ -52,7 +52,7 @@ typedef struct {
     MemoryRegion bpf_ram;
     MemoryRegion bpf_mmio;
 
-    bool running;
+    struct ubpf_vm *vm;
 
     QemuThread thread;
     QemuMutex thr_mutex;
@@ -81,7 +81,6 @@ typedef struct {
     QEMUTimer dma_timer;
     char dma_buf[DMA_SIZE];
     uint64_t dma_mask;
-    struct ubpf_vm *vm;
 } BpfState;
 
 static bool bpf_msi_enabled(BpfState *bpf)
@@ -165,69 +164,7 @@ static void bpf_dma_timer(void *opaque)
     }
 }
 
-static void dma_rw(BpfState *bpf, bool write, dma_addr_t *val, dma_addr_t *dma,
-                bool timer)
-{
-    if (write && (bpf->dma.cmd & BPF_DMA_RUN)) {
-        return;
-    }
-
-    if (write) {
-        *dma = *val;
-    } else {
-        *val = *dma;
-    }
-
-    if (timer) {
-        timer_mod(&bpf->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-    }
-}
-
-static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
-{
-    BpfState *bpf = opaque;
-    uint64_t val = ~0ULL;
-
-    if (size != 4) {
-        return val;
-    }
-
-    switch (addr) {
-    case 0x00:
-        val = 0x010000;
-        break;
-    case 0x04:
-        val = bpf->addr4;
-        break;
-    case 0x08:
-        qemu_mutex_lock(&bpf->thr_mutex);
-        val = bpf->fact;
-        qemu_mutex_unlock(&bpf->thr_mutex);
-        break;
-    case 0x20:
-        val = atomic_read(&bpf->status);
-        break;
-    case 0x24:
-        val = bpf->irq_status;
-        break;
-    case 0x80:
-        dma_rw(bpf, false, &val, &bpf->dma.src, false);
-        break;
-    case 0x88:
-        dma_rw(bpf, false, &val, &bpf->dma.dst, false);
-        break;
-    case 0x90:
-        dma_rw(bpf, false, &val, &bpf->dma.cnt, false);
-        break;
-    case 0x98:
-        dma_rw(bpf, false, &val, &bpf->dma.cmd, false);
-        break;
-    }
-
-    return val;
-}
-
-static void bpf_start_program(BpfState *bpf)
+static int bpf_start_program(BpfState *bpf)
 {
     void *bpf_ram_ptr = memory_region_get_ram_ptr(&bpf->bpf_ram);
     int32_t code_len = *((int32_t*) bpf_ram_ptr) + EBPF_PROG_LEN_OFFSET;
@@ -237,7 +174,7 @@ static void bpf_start_program(BpfState *bpf)
     bpf->vm = ubpf_create();
     if (!bpf->vm) {
         fprintf(stderr, "Failed to create VM\n");
-        return;
+        return 1;
     }
 
     int32_t rv = ubpf_load(bpf->vm, code, code_len, &errmsg);
@@ -246,7 +183,7 @@ static void bpf_start_program(BpfState *bpf)
         ubpf_destroy(bpf->vm);
         bpf->vm = NULL;
         free(errmsg);
-        return;
+        return 1;
     }
 
     uint64_t ret = ubpf_exec(bpf->vm, NULL, 0);
@@ -256,14 +193,34 @@ static void bpf_start_program(BpfState *bpf)
 
     ubpf_destroy(bpf->vm);
     bpf->vm = NULL;
+
+    return 0;
 }
 
-static void bpf_stop_program(BpfState *bpf)
+static int bpf_stop_program(BpfState *bpf)
 {
     if (bpf->vm) {
         ubpf_destroy(bpf->vm);
         bpf->vm = NULL;
     }
+    return 0;
+}
+
+static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    BpfState *bpf = opaque;
+    uint64_t val = ~0ULL;
+
+    switch (addr) {
+    case 0x00:
+        val = (bpf->vm == NULL);
+        break;
+    default:
+        fprintf(stderr, "Invalid read (reserved)\n");
+        break;
+    }
+
+    return val;
 }
 
 static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
@@ -272,24 +229,18 @@ static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     BpfState *bpf = opaque;
 
     switch (addr) {
-        case 0x0:
-            if (val & EBPF_START) {
-                if (bpf->running) {
-                    bpf_stop_program(bpf);
-                }
-                bpf_start_program(bpf);
-                bpf->running = true;
-            }
-            else {
-                if (!bpf->running) {
-                    bpf_stop_program(bpf);
-                    bpf->running = false;
-                }
-            }
-            break;
-        default:
-            fprintf(stderr, "Invalid address (reserved) \n");
-            break;
+    case 0x0:
+        if (val & EBPF_START) {
+            bpf_stop_program(bpf);
+            bpf_start_program(bpf);
+        }
+        else {
+            bpf_stop_program(bpf);
+        }
+        break;
+    default:
+        fprintf(stderr, "Invalid address (reserved) \n");
+        break;
     }
 }
 
