@@ -45,6 +45,7 @@
 #define EBPF_PROG_LEN_OFFSET    0x0
 #define EBPF_PROG_OFFSET        0x1000
 #define EBPF_RET_OFFSET         0x200000
+#define EBPF_REGS_OFFSET        0x200004
 #define EBPF_START              0x1
 
 typedef struct {
@@ -170,8 +171,12 @@ static int bpf_start_program(BpfState *bpf)
     void *bpf_ram_ptr = memory_region_get_ram_ptr(&bpf->bpf_ram);
     int32_t code_len = *((int32_t*) bpf_ram_ptr) + EBPF_PROG_LEN_OFFSET;
     void* code = bpf_ram_ptr + EBPF_PROG_OFFSET;
+    uint64_t* regs = (uint64_t*) (bpf_ram_ptr + EBPF_REGS_OFFSET);
+    uint64_t *ret_addr = (uint64_t*) (bpf_ram_ptr + EBPF_RET_OFFSET);
+
     char *errmsg;
     int32_t rv;
+    uint64_t ret;
     bool elf;
 
     bpf->vm = ubpf_create();
@@ -197,9 +202,8 @@ static int bpf_start_program(BpfState *bpf)
         return 1;
     }
 
-    uint64_t ret = ubpf_exec(bpf->vm, NULL, 0);
+    ret = ubpf_exec(bpf->vm, NULL, 0, regs);
 
-    uint64_t *ret_addr = (uint64_t*) (bpf_ram_ptr + EBPF_RET_OFFSET);
     *ret_addr = ret;
 
     ubpf_destroy(bpf->vm);
