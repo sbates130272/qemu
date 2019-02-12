@@ -30,7 +30,7 @@
 #include "qemu/main-loop.h" /* iothread mutex */
 #include "qapi/visitor.h"
 #include "qapi/error.h"
-#include <ubpf/ubpf.h>
+#include <ubpf.h>
 #include <elf.h>
 
 #define TYPE_PCI_BPF_DEVICE "pcie-ubpf"
@@ -202,7 +202,8 @@ static int bpf_start_program(BpfState *bpf)
         return 1;
     }
 
-    ret = ubpf_exec(bpf->vm, NULL, 0, regs);
+    ubpf_set_registers(bpf->vm, regs);
+    ret = ubpf_exec(bpf->vm, NULL, 0);
 
     *ret_addr = ret;
 
