@@ -170,9 +170,9 @@ static void bpf_dma_timer(void *opaque)
 
 static int bpf_start_program(BpfState *bpf)
 {
-    void *bpf_ram_ptr = memory_region_get_ram_ptr(&bpf->bpf_ram);
-    int32_t code_len = *((int32_t*) bpf_ram_ptr) + EBPF_PROG_LEN_OFFSET;
-    int32_t mem_len  = *((int32_t*) bpf_ram_ptr) + EBPF_MEM_LEN_OFFSET;
+    char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
+    int32_t code_len = *(int32_t*) (bpf_ram_ptr + EBPF_PROG_LEN_OFFSET);
+    int32_t mem_len =  *(int32_t*) (bpf_ram_ptr + EBPF_MEM_LEN_OFFSET);
     void* code = bpf_ram_ptr + EBPF_PROG_OFFSET;
     void* mem  = bpf_ram_ptr + EBPF_MEM_OFFSET;
     uint64_t* regs = (uint64_t*) (bpf_ram_ptr + EBPF_REGS_OFFSET);
