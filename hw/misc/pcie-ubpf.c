@@ -46,9 +46,12 @@
 #define EBPF_MEM_LEN_OFFSET     0x4
 #define EBPF_PROG_OFFSET        0x1000
 #define EBPF_RET_OFFSET         0x200000
-#define EBPF_REGS_OFFSET        0x200004
-#define EBPF_MEM_OFFSET         0x300000
+#define EBPF_READY_OFFSET       0x200004
+#define EBPF_REGS_OFFSET        0x200008
+#define EBPF_MEM_OFFSET         0x800000
 #define EBPF_START              0x1
+#define EBPF_NOT_READY          0x0
+#define EBPF_READY              0x1
 
 typedef struct {
     PCIDevice pdev;
@@ -176,12 +179,15 @@ static int bpf_start_program(BpfState *bpf)
     void* code = bpf_ram_ptr + EBPF_PROG_OFFSET;
     void* mem  = bpf_ram_ptr + EBPF_MEM_OFFSET;
     uint64_t* regs = (uint64_t*) (bpf_ram_ptr + EBPF_REGS_OFFSET);
+    bool *ready_addr = (bool*) (bpf_ram_ptr + EBPF_READY_OFFSET);
     uint64_t *ret_addr = (uint64_t*) (bpf_ram_ptr + EBPF_RET_OFFSET);
 
     char *errmsg;
     int32_t rv;
     uint64_t ret;
     bool elf;
+
+    *ready_addr = EBPF_NOT_READY;
 
     bpf->vm = ubpf_create();
     if (!bpf->vm) {
@@ -218,6 +224,7 @@ static int bpf_start_program(BpfState *bpf)
 
     ubpf_destroy(bpf->vm);
     bpf->vm = NULL;
+    *ready_addr = EBPF_READY;
 
     return 0;
 }
