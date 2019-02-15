@@ -3791,8 +3791,7 @@ fi
 
 if test "$libubpf" != "no" ; then
   cat > $TMPC <<EOF
-#include <ubpf/ubpf.h>
-#include <ubpf/ubpf_int.h>
+#include <ubpf.h>
 int main(void) { ubpf_create(); return 0; }
 EOF
   if compile_prog "" "-lubpf" ; then
