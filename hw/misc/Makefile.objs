@@ -77,3 +77,7 @@ obj-$(CONFIG_ASPEED_SOC) += aspeed_scu.o aspeed_sdmc.o
 obj-$(CONFIG_MSF2) += msf2-sysreg.o
 
 pcie-ubpf.o-libs   := -lubpf
+ifeq ($(CONFIG_LIBROCKSDB), y)
+	# TODO: Are all the following libraries really necessary?
+	pcie-ubpf.o-libs += -lrocksdb -lpthread -lrt -lsnappy -lz -lbz2 -llz4 -lzstd -lnuma -ltbb -lm
+endif

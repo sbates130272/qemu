@@ -29,6 +29,10 @@
 #include "qemu/main-loop.h" /* iothread mutex */
 #include "qapi/visitor.h"
 #include "qapi/error.h"
+#ifdef CONFIG_LIBROCKSDB
+#include <rocksdb/c_sst_utils.h>
+#endif
+
 #include <ubpf.h>
 #include <elf.h>
 
@@ -175,6 +179,14 @@ static int bpf_start_program(BpfState *bpf)
     *ready_addr = EBPF_NOT_READY;
 
     bpf->vm = ubpf_create();
+#ifdef CONFIG_LIBROCKSDB
+    /* ids [0,4] are already used by mainline ubpf, so we start from 5
+     * to avoid conflicts
+     */
+    ubpf_register(bpf->vm, 5, "CreateSSTUtils", CreateSSTUtils);
+    ubpf_register(bpf->vm, 6, "Init", Init);
+    ubpf_register(bpf->vm, 7, "Find", Find);
+#endif
     if (!bpf->vm) {
         fprintf(stderr, "Failed to create VM\n");
         return 1;
