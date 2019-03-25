@@ -26,7 +26,6 @@
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/msi.h"
-#include "qemu/timer.h"
 #include "qemu/main-loop.h" /* iothread mutex */
 #include "qapi/visitor.h"
 #include "qapi/error.h"
@@ -50,8 +49,15 @@
 #define EBPF_REGS_OFFSET        0x200008
 #define EBPF_MEM_OFFSET         0x800000
 #define EBPF_START              0x1
+
 #define EBPF_NOT_READY          0x0
 #define EBPF_READY              0x1
+
+#define EBPF_BAR_SIZE           (16 * MiB)
+#define EBPF_RAM_SIZE           EBPF_BAR_SIZE
+#define EBPF_MMIO_SIZE          (1 * MiB)
+#define EBPF_RAM_OFFSET         (0x0)
+#define EBPF_MMIO_OFFSET        (1 * MiB)
 
 typedef struct {
     PCIDevice pdev;
@@ -74,18 +80,12 @@ typedef struct {
 
     uint32_t irq_status;
 
-#define BPF_DMA_RUN             0x1
-#define BPF_DMA_DIR(cmd)        (((cmd) & 0x2) >> 1)
-# define BPF_DMA_FROM_PCI       0
-# define BPF_DMA_TO_PCI         1
-#define BPF_DMA_IRQ             0x4
     struct dma_state {
         dma_addr_t src;
         dma_addr_t dst;
         dma_addr_t cnt;
         dma_addr_t cmd;
     } dma;
-    QEMUTimer dma_timer;
     char dma_buf[DMA_SIZE];
     uint64_t dma_mask;
 } BpfState;
@@ -107,78 +107,14 @@ static void bpf_raise_irq(BpfState *bpf, uint32_t val)
     }
 }
 
-static bool within(uint32_t addr, uint32_t start, uint32_t end)
-{
-    return start <= addr && addr < end;
-}
-
-static void bpf_check_range(uint32_t addr, uint32_t size1, uint32_t start,
-                uint32_t size2)
-{
-    uint32_t end1 = addr + size1;
-    uint32_t end2 = start + size2;
-
-    if (within(addr, start, end2) &&
-            end1 > addr && within(end1, start, end2)) {
-        return;
-    }
-
-    hw_error("BPF: DMA range 0x%.8x-0x%.8x out of bounds (0x%.8x-0x%.8x)!",
-            addr, end1 - 1, start, end2 - 1);
-}
-
-static dma_addr_t bpf_clamp_addr(const BpfState *bpf, dma_addr_t addr)
-{
-    dma_addr_t res = addr & bpf->dma_mask;
-
-    if (addr != res) {
-        printf("BPF: clamping DMA %#.16"PRIx64" to %#.16"PRIx64"!\n", addr, res);
-    }
-
-    return res;
-}
-
-static void bpf_dma_timer(void *opaque)
-{
-    BpfState *bpf = opaque;
-    bool raise_irq = false;
-
-    if (!(bpf->dma.cmd & BPF_DMA_RUN)) {
-        return;
-    }
-
-    if (BPF_DMA_DIR(bpf->dma.cmd) == BPF_DMA_FROM_PCI) {
-        uint32_t dst = bpf->dma.dst;
-        bpf_check_range(dst, bpf->dma.cnt, DMA_START, DMA_SIZE);
-        dst -= DMA_START;
-        pci_dma_read(&bpf->pdev, bpf_clamp_addr(bpf, bpf->dma.src),
-                bpf->dma_buf + dst, bpf->dma.cnt);
-    } else {
-        uint32_t src = bpf->dma.src;
-        bpf_check_range(src, bpf->dma.cnt, DMA_START, DMA_SIZE);
-        src -= DMA_START;
-        pci_dma_write(&bpf->pdev, bpf_clamp_addr(bpf, bpf->dma.dst),
-                bpf->dma_buf + src, bpf->dma.cnt);
-    }
-
-    bpf->dma.cmd &= ~BPF_DMA_RUN;
-    if (bpf->dma.cmd & BPF_DMA_IRQ) {
-        raise_irq = true;
-    }
-
-    if (raise_irq) {
-        bpf_raise_irq(bpf, DMA_IRQ);
-    }
-}
-
 static int bpf_start_program(BpfState *bpf)
 {
     char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
-    int32_t code_len = *(int32_t*) (bpf_ram_ptr + EBPF_PROG_LEN_OFFSET);
-    int32_t mem_len =  *(int32_t*) (bpf_ram_ptr + EBPF_MEM_LEN_OFFSET);
-    void* code = bpf_ram_ptr + EBPF_PROG_OFFSET;
-    void* mem  = bpf_ram_ptr + EBPF_MEM_OFFSET;
-    uint64_t* regs = (uint64_t*) (bpf_ram_ptr + EBPF_REGS_OFFSET);
+    uint32_t code_len = *(uint32_t*) (bpf_ram_ptr + EBPF_PROG_LEN_OFFSET);
+    uint32_t mem_len =  *(uint32_t*) (bpf_ram_ptr + EBPF_MEM_LEN_OFFSET);
+    void *code = bpf_ram_ptr + EBPF_PROG_OFFSET;
+    void *mem  = bpf_ram_ptr + EBPF_MEM_OFFSET;
+    uint64_t *regs = (uint64_t*) (bpf_ram_ptr + EBPF_REGS_OFFSET);
     bool *ready_addr = (bool*) (bpf_ram_ptr + EBPF_READY_OFFSET);
     uint64_t *ret_addr = (uint64_t*) (bpf_ram_ptr + EBPF_RET_OFFSET);
 
@@ -248,7 +184,7 @@ static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
         val = (bpf->vm == NULL);
         break;
     default:
-        fprintf(stderr, "Invalid read (reserved)\n");
+        //fprintf(stderr, "Invalid read (reserved)\n");
         break;
     }
 
@@ -342,20 +278,19 @@ static void pci_bpf_realize(PCIDevice *pdev, Error **errp)
         return;
     }
 
-    timer_init_ms(&bpf->dma_timer, QEMU_CLOCK_VIRTUAL, bpf_dma_timer, bpf);
-
     qemu_mutex_init(&bpf->thr_mutex);
     qemu_cond_init(&bpf->thr_cond);
     qemu_thread_create(&bpf->thread, "bpf", bpf_fact_thread,
                        bpf, QEMU_THREAD_JOINABLE);
 
-    memory_region_init(&bpf->bpf_bar, OBJECT(bpf), "bpf-bar", 16 * MiB);
-    memory_region_init_ram(&bpf->bpf_ram, OBJECT(bpf), "bpf-ram", 16 * MiB, &error_fatal);
+    memory_region_init(&bpf->bpf_bar, OBJECT(bpf), "bpf-bar", EBPF_BAR_SIZE);
+    memory_region_init_ram(&bpf->bpf_ram, OBJECT(bpf), "bpf-ram", EBPF_RAM_SIZE, &error_fatal);
     memory_region_init_io(&bpf->bpf_mmio, OBJECT(bpf), &bpf_mmio_ops, bpf,
-                    "bpf-mmio", 1 * MiB);
-    memory_region_add_subregion_overlap(&bpf->bpf_bar, 0x0, &bpf->bpf_ram, 1);
-    memory_region_add_subregion_overlap(&bpf->bpf_bar, 1 * MiB, &bpf->bpf_mmio, 2);
+                    "bpf-mmio", EBPF_MMIO_SIZE);
+    memory_region_add_subregion_overlap(&bpf->bpf_bar, EBPF_RAM_OFFSET, &bpf->bpf_ram, 1);
+    memory_region_add_subregion_overlap(&bpf->bpf_bar, EBPF_MMIO_OFFSET, &bpf->bpf_mmio, 2);
     pci_register_bar(pdev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_PREFETCH, &bpf->bpf_bar);
+
 }
 
 static void pci_bpf_uninit(PCIDevice *pdev)
@@ -370,8 +305,6 @@ static void pci_bpf_uninit(PCIDevice *pdev)
 
     qemu_cond_destroy(&bpf->thr_cond);
     qemu_mutex_destroy(&bpf->thr_mutex);
-
-    timer_del(&bpf->dma_timer);
 }
 
 static void bpf_obj_uint64(Object *obj, Visitor *v, const char *name,
