@@ -47,11 +47,12 @@
 #define EBPF_RET_OFFSET         0x200000
 #define EBPF_READY_OFFSET       0x200004
 #define EBPF_REGS_OFFSET        0x200008
-#define EBPF_MEM_OFFSET         0x800000
+#define EBPF_MEM_OFFSET         0x400000
 #define EBPF_START              0x1
 
 #define EBPF_NOT_READY          0x0
 #define EBPF_READY              0x1
+#define DMA_DONE                0x4
 
 #define EBPF_BAR_SIZE           (16 * MiB)
 #define EBPF_RAM_SIZE           EBPF_BAR_SIZE
@@ -81,14 +82,70 @@ typedef struct {
     uint32_t irq_status;
 
     struct dma_state {
-        dma_addr_t src;
-        dma_addr_t dst;
-        dma_addr_t cnt;
-        dma_addr_t cmd;
+        uint8_t opcode;
+        uint8_t ctrl;
+        uint32_t length;
+        uint32_t offset;
+        uint64_t addr;
     } dma;
     char dma_buf[DMA_SIZE];
     uint64_t dma_mask;
 } BpfState;
+
+/* Function hexDump was copied from https://stackoverflow.com/a/7776146 */
+static void hexDump (const char *desc, void *addr, int len)
+{
+    int i;
+    unsigned char buff[17];
+    unsigned char *pc = (unsigned char*)addr;
+
+    // Output description if given.
+    if (desc != NULL)
+        printf ("%s (%d bytes):\n", desc, len);
+
+    if (len == 0) {
+        printf("  ZERO LENGTH\n");
+        return;
+    }
+    if (len < 0) {
+        printf("  NEGATIVE LENGTH: %i\n",len);
+        return;
+    }
+
+    // Process every byte in the data.
+    for (i = 0; i < len; i++) {
+        // Multiple of 16 means new line (with line offset).
+
+        if ((i % 16) == 0) {
+            // Just don't print ASCII for the zeroth line.
+            if (i != 0)
+                printf ("  %s\n", buff);
+
+            // Output the offset.
+            printf ("  %04x ", i);
+        }
+
+        // Now the hex code for the specific character.
+        printf (" %02x", pc[i]);
+
+        // And store a printable ASCII character for later.
+        if ((pc[i] < 0x20) || (pc[i] > 0x7e))
+            buff[i % 16] = '.';
+        else
+            buff[i % 16] = pc[i];
+        buff[(i % 16) + 1] = '\0';
+    }
+
+    // Pad out last line if not exactly 16 characters.
+    while ((i % 16) != 0) {
+        printf ("   ");
+        i++;
+    }
+
+    // And print the final ASCII bit.
+    printf ("  %s\n", buff);
+}
+
 
 static bool bpf_msi_enabled(BpfState *bpf)
 {
@@ -180,8 +237,20 @@ static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
     uint64_t val = ~0ULL;
 
     switch (addr) {
-    case 0x00:
-        val = (bpf->vm == NULL);
+    case 0x0:
+        val = bpf->dma.opcode;
+        break;
+    case 0x1:
+        val = bpf->dma.ctrl;
+        break;
+    case 0x4:
+        val = bpf->dma.length;
+        break;
+    case 0x8:
+        val = bpf->dma.offset;
+        break;
+    case 0xc:
+        val = bpf->dma.addr;
         break;
     default:
         //fprintf(stderr, "Invalid read (reserved)\n");
@@ -191,30 +260,110 @@ static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
+static void program_text(BpfState *bpf)
+{
+    char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
+    void *code = bpf_ram_ptr + EBPF_PROG_OFFSET;
+    uint32_t *code_len = (uint32_t*) (bpf_ram_ptr + EBPF_PROG_LEN_OFFSET);
+
+    pci_dma_read(&bpf->pdev, bpf->dma.addr, code + bpf->dma.offset, bpf->dma.length);
+    if (bpf->dma.offset == 0)
+        *code_len = bpf->dma.length;
+    else
+        *code_len += bpf->dma.length;
+
+    bpf->dma.ctrl |= DMA_DONE;
+}
+
+static void program_data(BpfState *bpf)
+{
+}
+
+static void run_program(BpfState *bpf)
+{
+}
+
+static void get_registers(BpfState *bpf)
+{
+}
+
+static void dump_memory(BpfState *bpf)
+{
+    char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
+    uint32_t code_len = *(uint32_t*) (bpf_ram_ptr + EBPF_PROG_LEN_OFFSET);
+    uint32_t mem_len =  *(uint32_t*) (bpf_ram_ptr + EBPF_MEM_LEN_OFFSET);
+
+    hexDump("prog", bpf_ram_ptr + EBPF_PROG_OFFSET, code_len);
+    hexDump("data", bpf_ram_ptr + EBPF_MEM_OFFSET, mem_len);
+}
+
+static void process_command(BpfState *bpf)
+{
+    fprintf(stderr, "Process Command: Opcode: [0x%02x]\tLength: [%u]\tAddr: [0x%08lx]\n",
+            bpf->dma.opcode & 0xff, bpf->dma.length, bpf->dma.addr);
+
+    switch (bpf->dma.opcode & 0xff) {
+        case 0x0:
+            program_text(bpf); break;
+        case 0x1:
+            program_data(bpf); break;
+        case 0x2:
+            run_program(bpf); break;
+        case 0x3:
+            get_registers(bpf); break;
+        case 0xff:
+            dump_memory(bpf); break;
+        default:
+            fprintf(stderr, "Invalid opcode: %u\n", bpf->dma.opcode & 0xff);
+    }
+}
+
+static void check_size(const char *name, unsigned expected, unsigned received)
+{
+    if (expected != received)
+        fprintf(stderr, "WARNING: %s should have size %u, received %u instead\n", name, expected, received);
+}
+
 static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                 unsigned size)
 {
     BpfState *bpf = opaque;
 
-    switch (addr) {
-    case 0x0:
-        if (val & EBPF_START) {
-            bpf_stop_program(bpf);
-            bpf_start_program(bpf);
-        }
-        else {
-            bpf_stop_program(bpf);
-        }
-        break;
-    default:
-        fprintf(stderr, "Invalid address (reserved) \n");
-        break;
+    fprintf(stderr, "Write of %d bytes at addr 0x%08lx with val %lu\n",
+        size, addr, val);
+
+    switch (addr & 0xff) {
+        case 0x0:
+            check_size("opcode", 1, size);
+            bpf->dma.opcode = val & 0xff;
+            break;
+        case 0x1:
+            check_size("ctrl", 1, size);
+            bpf->dma.ctrl = val & 0xff;
+            process_command(bpf);
+            break;
+        case 0x4:
+            check_size("length", 4, size);
+            bpf->dma.length = val & 0xffffffff;
+            break;
+        case 0x8:
+            check_size("offset", 4, size);
+            bpf->dma.offset = val & 0xffffffff;
+            break;
+        case 0xc:
+            check_size("addr", 8, size);
+            bpf->dma.addr = val;
+            break;
     }
 }
 
 static const MemoryRegionOps bpf_mmio_ops = {
     .read = bpf_mmio_read,
     .write = bpf_mmio_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 8,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -319,7 +468,7 @@ static void bpf_instance_init(Object *obj)
 {
     BpfState *bpf = BPF(obj);
 
-    bpf->dma_mask = (1UL << 28) - 1;
+    bpf->dma_mask = ~0ULL; /* 64-bit */
     object_property_add(obj, "dma_mask", "uint64", bpf_obj_uint64,
                     bpf_obj_uint64, NULL, &bpf->dma_mask, NULL);
 }
