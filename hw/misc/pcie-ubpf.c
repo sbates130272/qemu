@@ -156,23 +156,6 @@ static void hexDump (const char *desc, void *addr, int len)
 }
 
 
-static bool bpf_msi_enabled(BpfState *bpf)
-{
-    return msi_enabled(&bpf->pdev);
-}
-
-static void bpf_raise_irq(BpfState *bpf, uint32_t val)
-{
-    bpf->irq_status |= val;
-    if (bpf->irq_status) {
-        if (bpf_msi_enabled(bpf)) {
-            msi_notify(&bpf->pdev, 0);
-        } else {
-            pci_set_irq(&bpf->pdev, 1);
-        }
-    }
-}
-
 static int bpf_start_program(BpfState *bpf)
 {
     char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
@@ -363,8 +346,11 @@ static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             break;
         case 0x1:
             check_size("ctrl", 1, size);
-            bpf->dma.ctrl = val & 0xff;
-            process_command(bpf);
+            bpf->cmd.ctrl = val & 0xff;
+            qemu_mutex_lock(&bpf->thr_mutex);
+            atomic_or(&bpf->status, BPF_STATUS_COMPUTING);
+            qemu_cond_signal(&bpf->thr_cond);
+            qemu_mutex_unlock(&bpf->thr_mutex);
             break;
         case 0x4:
             check_size("length", 4, size);
@@ -395,12 +381,11 @@ static const MemoryRegionOps bpf_mmio_ops = {
  * We purposely use a thread, so that users are forced to wait for the status
  * register.
  */
-static void *bpf_fact_thread(void *opaque)
+static void *bpf_cmd_thread(void *opaque)
 {
     BpfState *bpf = opaque;
 
     while (1) {
-        uint32_t val, ret = 1;
 
         qemu_mutex_lock(&bpf->thr_mutex);
         while ((atomic_read(&bpf->status) & BPF_STATUS_COMPUTING) == 0 &&
@@ -413,28 +398,10 @@ static void *bpf_fact_thread(void *opaque)
             break;
         }
 
-        val = bpf->fact;
+        process_command(bpf);
         qemu_mutex_unlock(&bpf->thr_mutex);
 
-        while (val > 0) {
-            ret *= val--;
-        }
-
-        /*
-         * We should sleep for a random period here, so that students are
-         * forced to check the status properly.
-         */
-
-        qemu_mutex_lock(&bpf->thr_mutex);
-        bpf->fact = ret;
-        qemu_mutex_unlock(&bpf->thr_mutex);
         atomic_and(&bpf->status, ~BPF_STATUS_COMPUTING);
-
-        if (atomic_read(&bpf->status) & BPF_STATUS_IRQFACT) {
-            qemu_mutex_lock_iothread();
-            bpf_raise_irq(bpf, FACT_IRQ);
-            qemu_mutex_unlock_iothread();
-        }
     }
 
     return NULL;
@@ -453,7 +420,7 @@ static void pci_bpf_realize(PCIDevice *pdev, Error **errp)
 
     qemu_mutex_init(&bpf->thr_mutex);
     qemu_cond_init(&bpf->thr_cond);
-    qemu_thread_create(&bpf->thread, "bpf", bpf_fact_thread,
+    qemu_thread_create(&bpf->thread, "bpf", bpf_cmd_thread,
                        bpf, QEMU_THREAD_JOINABLE);
 
     memory_region_init(&bpf->bpf_bar, OBJECT(bpf), "bpf-bar", EBPF_BAR_SIZE);
