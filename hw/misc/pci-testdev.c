@@ -24,6 +24,7 @@
 #include "qemu/event_notifier.h"
 #include "qemu/module.h"
 #include "system/kvm.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 typedef struct PCITestDevHdr {
@@ -79,6 +80,28 @@ enum {
 #define IOTEST_ACCESS_TYPE uint8_t
 #define IOTEST_ACCESS_WIDTH (sizeof(uint8_t))
 
+/*
+ * DMA Target BAR Protocol
+ * This region is RAM-backed so VFIO devices can DMA to it.
+ * QEMU polls this region to detect DMA writes.
+ */
+#define DMA_BAR_MAGIC_OFFSET    0x00
+#define DMA_BAR_SEQ_OFFSET      0x04
+#define DMA_BAR_POLL_CNT_OFFSET 0x08
+#define DMA_BAR_LAST_SEQ_OFFSET 0x0C
+#define DMA_BAR_DATA_OFFSET     0x10
+
+#define DMA_BAR_MAGIC_VALUE     0xDEADBEEF
+#define DMA_BAR_MIN_SIZE        0x1000  /* 4KB minimum */
+
+typedef struct DMATargetRegion {
+    volatile uint32_t magic;         /* Magic value for validity */
+    volatile uint32_t sequence;      /* Sequence number from DMA writer */
+    volatile uint32_t poll_count;    /* Number of times QEMU detected changes */
+    volatile uint32_t last_sequence; /* Last sequence QEMU saw */
+    uint8_t data[];                  /* Additional data area */
+} DMATargetRegion;
+
 struct PCITestDevState {
     /*< private >*/
     PCIDevice parent_obj;
@@ -92,6 +115,12 @@ struct PCITestDevState {
     uint64_t membar_size;
     bool membar_backed;
     MemoryRegion membar;
+
+    /* DMA target BAR with polling */
+    uint64_t dma_bar_size;
+    uint64_t dma_poll_interval;  /* nanoseconds */
+    MemoryRegion dma_bar;
+    QEMUTimer *dma_poll_timer;
 };
 
 #define TYPE_PCI_TEST_DEV "pci-testdev"
@@ -136,7 +165,7 @@ static void pci_testdev_stop(IOTest *test)
 static void
 pci_testdev_reset(PCITestDevState *d)
 {
-    if (d->current == -1) {
+    if (d->current == -1 || !d->tests) {
         return;
     }
     pci_testdev_stop(&d->tests[d->current]);
@@ -240,12 +269,91 @@ static const MemoryRegionOps pci_testdev_pio_ops = {
     },
 };
 
+/*
+ * Poll the DMA target BAR for changes
+ * This detects when a VFIO device has written to the RAM-backed BAR
+ */
+static void pci_testdev_dma_poll(void *opaque)
+{
+    PCITestDevState *d = PCI_TEST_DEV(opaque);
+    DMATargetRegion *dma_region;
+    uint32_t current_magic, current_seq, last_seq;
+
+    if (!d->dma_bar_size) {
+        return;
+    }
+
+    /* Get pointer to RAM backing the DMA BAR */
+    dma_region = (DMATargetRegion *)memory_region_get_ram_ptr(&d->dma_bar);
+
+    /* Read current values */
+    current_magic = qatomic_read(&dma_region->magic);
+    current_seq = qatomic_read(&dma_region->sequence);
+    last_seq = qatomic_read(&dma_region->last_sequence);
+
+    /*
+     * Detect write: valid magic and sequence number changed
+     * Note: Using volatile pointers and atomic reads to ensure we see
+     * DMA writes from VFIO devices (which bypass QEMU entirely)
+     */
+    if (current_magic == DMA_BAR_MAGIC_VALUE && current_seq != last_seq) {
+        uint32_t poll_count = qatomic_read(&dma_region->poll_count);
+
+        /* Update poll count and last sequence */
+        qatomic_set(&dma_region->poll_count, poll_count + 1);
+        qatomic_set(&dma_region->last_sequence, current_seq);
+    }
+
+    /* Re-arm timer */
+    timer_mod(d->dma_poll_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + d->dma_poll_interval);
+}
+
+/*
+ * Initialize DMA target BAR
+ */
+static void pci_testdev_init_dma_bar(PCITestDevState *d, Error **errp)
+{
+    if (d->dma_bar_size < DMA_BAR_MIN_SIZE) {
+        error_setg(errp, "dma-bar-size must be at least %u bytes",
+                   DMA_BAR_MIN_SIZE);
+        return;
+    }
+
+    /* Create RAM-backed region - use memory_region_init_ram instead */
+    memory_region_init_ram(&d->dma_bar, OBJECT(d),
+                          "pci-testdev-dma-target",
+                          d->dma_bar_size, errp);
+    if (*errp) {
+        return;
+    }
+
+    /* Set up polling timer */
+    d->dma_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      pci_testdev_dma_poll, d);
+    if (d->dma_poll_interval > 0) {
+        timer_mod(d->dma_poll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + d->dma_poll_interval);
+    }
+}
+
 static void pci_testdev_realize(PCIDevice *pci_dev, Error **errp)
 {
     PCITestDevState *d = PCI_TEST_DEV(pci_dev);
     uint8_t *pci_conf;
     char *name;
     int r, i;
+
+    /* Validate DMA polling interval */
+    if (d->dma_bar_size && d->dma_poll_interval == 0) {
+        /* Default to 10μs polling interval */
+        d->dma_poll_interval = 10000;
+    }
+
+    if (d->dma_bar_size && d->dma_poll_interval < 1000) {
+        error_setg(errp, "dma-poll-interval must be at least 1000ns (1μs)");
+        return;
+    }
 
     pci_conf = pci_dev->config;
 
@@ -272,6 +380,19 @@ static void pci_testdev_realize(PCIDevice *pci_dev, Error **errp)
                          PCI_BASE_ADDRESS_MEM_PREFETCH |
                          PCI_BASE_ADDRESS_MEM_TYPE_64,
                          &d->membar);
+    }
+
+    /* Set up DMA target BAR if requested */
+    if (d->dma_bar_size) {
+        pci_testdev_init_dma_bar(d, errp);
+        if (*errp) {
+            return;
+        }
+        pci_register_bar(pci_dev, 3,
+                         PCI_BASE_ADDRESS_SPACE_MEMORY |
+                         PCI_BASE_ADDRESS_MEM_PREFETCH |
+                         PCI_BASE_ADDRESS_MEM_TYPE_64,
+                         &d->dma_bar);
     }
 
     d->current = -1;
@@ -310,6 +431,11 @@ pci_testdev_uninit(PCIDevice *dev)
     PCITestDevState *d = PCI_TEST_DEV(dev);
     int i;
 
+    if (d->dma_poll_timer) {
+        timer_free(d->dma_poll_timer);
+        d->dma_poll_timer = NULL;
+    }
+
     pci_testdev_reset(d);
     for (i = 0; i < IOTEST_MAX; ++i) {
         if (d->tests[i].hasnotifier) {
@@ -329,6 +455,14 @@ static void qdev_pci_testdev_reset(DeviceState *dev)
 static const Property pci_testdev_properties[] = {
     DEFINE_PROP_SIZE("membar", PCITestDevState, membar_size, 0),
     DEFINE_PROP_BOOL("membar-backed", PCITestDevState, membar_backed, false),
+    DEFINE_PROP_SIZE("dma-bar-size", PCITestDevState, dma_bar_size, 0),
+    /*
+     * Polling interval in nanoseconds. Default 10000ns = 10μs.
+     * Lower values = lower latency but higher overhead.
+     * Set to 0 to disable automatic polling.
+     */
+    DEFINE_PROP_UINT64("dma-poll-interval", PCITestDevState,
+                       dma_poll_interval, 10000),
 };
 
 static void pci_testdev_class_init(ObjectClass *klass, const void *data)

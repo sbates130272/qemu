@@ -2091,6 +2091,7 @@ M: Marcel Apfelbaum <marcel.apfelbaum@gmail.com>
 S: Supported
 F: include/hw/pci/*
 F: hw/misc/pci-testdev.c
+F: tests/qtest/pci-testdev-dma-test.c
 F: hw/pci/*
 F: hw/pci-bridge/*
 F: qapi/pci.json
