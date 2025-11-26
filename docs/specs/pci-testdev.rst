@@ -279,3 +279,171 @@ BAR callbacks. This function:
 This enables VFIO devices to interact with emulated device state in ways
 that were previously only possible through CPU intervention, making it
 useful for testing complex device-to-device interaction patterns.
+
+Doorbell DMA Engine (BAR0)
+===========================
+
+An optional doorbell-based DMA descriptor engine is available in BAR0 at
+offset 0x100. This feature is disabled by default and can be enabled using
+the ``doorbell-dma=on`` property.
+
+The doorbell mechanism allows guests to submit DMA operations (READ, WRITE,
+FILL) by writing descriptor addresses to a doorbell register. This mirrors
+real hardware DMA engines found in NVMe controllers, network cards, and GPUs.
+
+Doorbell Registers
+------------------
+
+Located in BAR0 starting at offset 0x100:
+
+.. code-block:: c
+
+  /* Doorbell register map in BAR0 */
+  Offset  Size  Access  Field              Description
+  0x100   8     WO      doorbell           Write descriptor GPA here
+  0x108   4     RO      status             0=idle, 1=busy, 2=done
+  0x10C   4     RO      error_code         0=success, else error
+  0x110   4     RO      read_count         Completed READ operations
+  0x114   4     RO      write_count        Completed WRITE operations
+  0x118   4     RO      fill_count         Completed FILL operations
+  0x11C   4     RO      error_count        Failed operations
+
+All counter registers reset to 0 on device reset.
+
+DMA Descriptor Format
+---------------------
+
+The descriptor is a 24-byte structure at a guest physical address:
+
+.. code-block:: c
+
+  typedef struct DMADescriptor {
+      uint32_t magic;             /* 0x00: Must be 0xDEADBELL */
+      uint8_t  opcode;            /* 0x04: 0=NOP, 1=READ, 2=WRITE, 3=FILL */
+      uint8_t  flags;             /* 0x05: Reserved (set to 0) */
+      uint16_t reserved;          /* 0x06: Reserved (set to 0) */
+      uint64_t address;           /* 0x08: Guest physical address */
+      uint32_t length;            /* 0x10: Number of bytes (max 4KB) */
+      uint32_t data;              /* 0x14: For FILL: 32-bit pattern */
+      uint64_t completion_addr;   /* 0x18: GPA for completion magic */
+  } DMADescriptor;
+
+All fields are little-endian.
+
+Doorbell Operations
+-------------------
+
+**NOP (opcode=0)**
+  No operation. Used for testing the mechanism.
+
+**READ (opcode=1)**
+  Reads ``length`` bytes from guest memory at ``address`` into device buffer.
+
+**WRITE (opcode=2)**
+  Writes test pattern (incrementing bytes 0x00, 0x01, 0x02...) to guest
+  memory at ``address`` for ``length`` bytes.
+
+**FILL (opcode=3)**
+  Fills ``length`` bytes of guest memory at ``address`` with repeating
+  32-bit pattern from ``data`` field.
+
+Completion Protocol
+-------------------
+
+When an operation completes, the device writes a 64-bit completion magic
+value (``0xDEADBEEFC0DEC0DE``) to the address specified in
+``completion_addr``. If ``completion_addr`` is 0, no completion write occurs.
+
+The guest workflow:
+
+1. Initialize completion location to 0
+2. Prepare descriptor with operation details
+3. Write descriptor GPA to doorbell register (0x100)
+4. Poll completion location for non-zero value
+5. When completion appears, check ``error_code`` register
+6. If error == 0: success (operation counter incremented)
+7. If error != 0: failure (error_count incremented)
+
+Example usage:
+
+.. code-block:: c
+
+  /* Allocate descriptor and completion location */
+  volatile uint64_t *completion = &some_memory;
+  *completion = 0;
+
+  struct DMADescriptor desc = {
+      .magic = 0xDEADBELL,
+      .opcode = 3,  /* FILL */
+      .address = target_gpa,
+      .length = 1024,
+      .data = 0xCAFEBABE,
+      .completion_addr = (uint64_t)completion
+  };
+
+  /* Write descriptor to guest memory */
+  uint64_t desc_gpa = ...;
+  memcpy((void *)desc_gpa, &desc, sizeof(desc));
+
+  /* Ring doorbell */
+  mmio_write64(bar0 + 0x100, desc_gpa);
+
+  /* Poll for completion (fast - in cache!) */
+  while (*completion == 0) { }
+
+  /* Check result */
+  uint32_t error = mmio_read32(bar0 + 0x10C);
+  if (error == 0) {
+      uint32_t fills = mmio_read32(bar0 + 0x118);
+      printf("Success! Total FILLs: %u\\n", fills);
+  }
+
+Doorbell Error Codes
+--------------------
+
+* 0: No error
+* 1: Invalid magic (descriptor.magic != 0xDEADBELL)
+* 2: Invalid opcode (unknown operation)
+* 3: Invalid length (0 or exceeds maximum)
+* 4: Invalid alignment (address misaligned)
+* 5: DMA read failed (cannot read descriptor)
+* 6: DMA operation failed (cannot perform DMA)
+
+Doorbell Usage
+--------------
+
+Enable the doorbell DMA engine::
+
+  -device pci-testdev,doorbell-dma=on
+
+Limit maximum transfer size::
+
+  -device pci-testdev,doorbell-dma=on,doorbell-dma-max=1024
+
+Doorbell Use Cases
+------------------
+
+The doorbell mechanism is useful for testing:
+
+* DMA descriptor ring patterns (like NVMe, network cards)
+* Memory validation (read and verify contents)
+* DMA performance measurement
+* Descriptor-based command submission
+* Completion notification mechanisms
+* Error handling in DMA engines
+
+Doorbell Testing
+----------------
+
+A qtest suite is provided in ``tests/qtest/pci-testdev-doorbell-test.c``
+covering:
+
+* NOP operation with completion
+* FILL operation with pattern verification
+* READ operation from guest memory
+* Error handling (invalid magic)
+* Disabled doorbell (feature off by default)
+
+Run with::
+
+  make check-qtest-x86_64

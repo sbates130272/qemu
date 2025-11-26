@@ -73,6 +73,7 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_PVPANIC_PCI') ? ['pvpanic-pci-test'] : []) +          \
   (config_all_devices.has_key('CONFIG_PCI_TESTDEV') ? ['pci-testdev-dma-test'] : []) +      \
   (config_all_devices.has_key('CONFIG_PCI_TESTDEV') ? ['pci-testdev-mmio-bridge-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_PCI_TESTDEV') ? ['pci-testdev-doorbell-test'] : []) + \
   (config_all_devices.has_key('CONFIG_HDA') ? ['intel-hda-test'] : []) +                    \
   (config_all_devices.has_key('CONFIG_I82801B11') ? ['i82801b11-test'] : []) +             \
   (config_all_devices.has_key('CONFIG_IOH3420') ? ['ioh3420-test'] : []) +                  \

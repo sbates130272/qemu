@@ -2092,6 +2092,8 @@ S: Supported
 F: include/hw/pci/*
 F: hw/misc/pci-testdev.c
 F: tests/qtest/pci-testdev-dma-test.c
+F: tests/qtest/pci-testdev-mmio-bridge-test.c
+F: tests/qtest/pci-testdev-doorbell-test.c
 F: hw/pci/*
 F: hw/pci-bridge/*
 F: qapi/pci.json
