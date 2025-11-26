@@ -91,15 +91,48 @@ enum {
 #define DMA_BAR_LAST_SEQ_OFFSET 0x0C
 #define DMA_BAR_DATA_OFFSET     0x10
 
+/* Extended command offsets for MMIO bridge */
+#define DMA_CMD_MAGIC_OFFSET    0x10
+#define DMA_CMD_BAR_OFFSET      0x14
+#define DMA_CMD_SIZE_OFFSET     0x15
+#define DMA_CMD_STATUS_OFFSET   0x16
+#define DMA_CMD_OFFSET_OFFSET   0x18
+#define DMA_CMD_DATA_OFFSET     0x20
+#define DMA_CMD_EXEC_CNT_OFFSET 0x28
+#define DMA_CMD_ERROR_OFFSET    0x2C
+
 #define DMA_BAR_MAGIC_VALUE     0xDEADBEEF
+#define DMA_CMD_MAGIC_VALUE     0xDEADC0DE
 #define DMA_BAR_MIN_SIZE        0x1000  /* 4KB minimum */
+
+/* Command status codes */
+#define DMA_CMD_STATUS_PENDING  0
+#define DMA_CMD_STATUS_SUCCESS  1
+#define DMA_CMD_STATUS_ERROR    2
+
+/* Error codes */
+#define DMA_CMD_ERROR_NONE         0
+#define DMA_CMD_ERROR_BAR_DISABLED 1
+#define DMA_CMD_ERROR_INVALID_BAR  2
+#define DMA_CMD_ERROR_INVALID_SIZE 3
+#define DMA_CMD_ERROR_OUT_OF_RANGE 4
 
 typedef struct DMATargetRegion {
     volatile uint32_t magic;         /* Magic value for validity */
     volatile uint32_t sequence;      /* Sequence number from DMA writer */
     volatile uint32_t poll_count;    /* Number of times QEMU detected changes */
     volatile uint32_t last_sequence; /* Last sequence QEMU saw */
-    uint8_t data[];                  /* Additional data area */
+    /* Command structure for MMIO bridge */
+    volatile uint32_t cmd_magic;     /* Command magic value */
+    volatile uint8_t  cmd_bar;       /* Target BAR number */
+    volatile uint8_t  cmd_size;      /* Write size (1,2,4,8) */
+    volatile uint16_t cmd_status;    /* Command status */
+    volatile uint64_t cmd_offset;    /* Offset in target BAR */
+    volatile uint64_t cmd_data;      /* Data to write */
+    volatile uint32_t cmd_exec_count;/* Number of commands executed */
+    volatile uint32_t cmd_error_code;/* Error code if failed */
+    uint8_t padding[0xD0];           /* Reserved */
+    uint8_t data[0xF00];             /* Additional data area */
 } DMATargetRegion;
 
 struct PCITestDevState {
@@ -121,6 +154,9 @@ struct PCITestDevState {
     uint64_t dma_poll_interval;  /* nanoseconds */
     MemoryRegion dma_bar;
     QEMUTimer *dma_poll_timer;
+    /* MMIO bridge support */
+    bool dma_enable_mmio_bridge;
+    uint32_t dma_last_cmd_seq;
 };
 
 #define TYPE_PCI_TEST_DEV "pci-testdev"
@@ -296,6 +332,7 @@ static void pci_testdev_dma_poll(void *opaque)
      * Note: Using volatile pointers and atomic reads to ensure we see
      * DMA writes from VFIO devices (which bypass QEMU entirely)
      */
+    /* Basic polling: detect any DMA write */
     if (current_magic == DMA_BAR_MAGIC_VALUE && current_seq != last_seq) {
         uint32_t poll_count = qatomic_read(&dma_region->poll_count);
 
@@ -304,6 +341,90 @@ static void pci_testdev_dma_poll(void *opaque)
         qatomic_set(&dma_region->last_sequence, current_seq);
     }
 
+    /* MMIO Bridge: execute commands to trigger BAR MMIO callbacks */
+    if (d->dma_enable_mmio_bridge) {
+        uint32_t cmd_magic = qatomic_read(&dma_region->cmd_magic);
+        uint16_t cmd_status;
+        uint8_t cmd_bar, cmd_size;
+        uint64_t cmd_offset, cmd_data;
+        MemoryRegion *target_mr = NULL;
+        MemTxResult result;
+
+        /* Check for valid command */
+        if (cmd_magic != DMA_CMD_MAGIC_VALUE) {
+            goto reschedule;
+        }
+
+        /* Check if this is a new command */
+        if (current_seq == d->dma_last_cmd_seq) {
+            goto reschedule;
+        }
+
+        cmd_status = qatomic_read(&dma_region->cmd_status);
+        if (cmd_status != DMA_CMD_STATUS_PENDING) {
+            goto reschedule;
+        }
+
+        /* Read command parameters */
+        cmd_bar = qatomic_read(&dma_region->cmd_bar);
+        cmd_size = qatomic_read(&dma_region->cmd_size);
+        cmd_offset = qatomic_read(&dma_region->cmd_offset);
+        cmd_data = qatomic_read(&dma_region->cmd_data);
+
+        /* Determine target BAR */
+        switch (cmd_bar) {
+        case 0:
+            target_mr = &d->mmio;
+            break;
+        case 1:
+            target_mr = &d->portio;
+            break;
+        case 2:
+            if (d->membar_size > 0) {
+                target_mr = &d->membar;
+            } else {
+                qatomic_set(&dma_region->cmd_status, DMA_CMD_STATUS_ERROR);
+                qatomic_set(&dma_region->cmd_error_code,
+                           DMA_CMD_ERROR_BAR_DISABLED);
+                goto reschedule;
+            }
+            break;
+        default:
+            qatomic_set(&dma_region->cmd_status, DMA_CMD_STATUS_ERROR);
+            qatomic_set(&dma_region->cmd_error_code,
+                       DMA_CMD_ERROR_INVALID_BAR);
+            goto reschedule;
+        }
+
+        /* Validate size */
+        if (cmd_size != 1 && cmd_size != 2 && cmd_size != 4 &&
+            cmd_size != 8) {
+            qatomic_set(&dma_region->cmd_status, DMA_CMD_STATUS_ERROR);
+            qatomic_set(&dma_region->cmd_error_code,
+                       DMA_CMD_ERROR_INVALID_SIZE);
+            goto reschedule;
+        }
+
+        /* Execute MMIO write - THIS TRIGGERS THE BAR CALLBACKS! */
+        result = memory_region_dispatch_write(target_mr, cmd_offset, cmd_data,
+                                             size_memop(cmd_size) | MO_LE,
+                                             MEMTXATTRS_UNSPECIFIED);
+
+        /* Update status */
+        if (result == MEMTX_OK) {
+            qatomic_set(&dma_region->cmd_status, DMA_CMD_STATUS_SUCCESS);
+            uint32_t exec_count = qatomic_read(&dma_region->cmd_exec_count);
+            qatomic_set(&dma_region->cmd_exec_count, exec_count + 1);
+        } else {
+            qatomic_set(&dma_region->cmd_status, DMA_CMD_STATUS_ERROR);
+            qatomic_set(&dma_region->cmd_error_code,
+                       DMA_CMD_ERROR_OUT_OF_RANGE);
+        }
+
+        d->dma_last_cmd_seq = current_seq;
+    }
+
+reschedule:
     /* Re-arm timer */
     timer_mod(d->dma_poll_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + d->dma_poll_interval);
@@ -463,6 +584,12 @@ static const Property pci_testdev_properties[] = {
      */
     DEFINE_PROP_UINT64("dma-poll-interval", PCITestDevState,
                        dma_poll_interval, 10000),
+    /*
+     * Enable MMIO bridge: allows DMA commands in BAR3 to trigger
+     * MMIO writes to other BARs (e.g., BAR0).
+     */
+    DEFINE_PROP_BOOL("dma-mmio-bridge", PCITestDevState,
+                     dma_enable_mmio_bridge, false),
 };
 
 static void pci_testdev_class_init(ObjectClass *klass, const void *data)
