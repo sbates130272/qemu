@@ -28,3 +28,13 @@ pcie_cap_slot_write_config(const char *parent, const char *child, const char *pd
 
 # shpc.c
 shpc_slot_command(const char *parent, int pci_slot, const char *child, const char *old_pic, const char *new_pic, const char *old_aic, const char *new_aic, const char *old_state, const char *new_state) "%s[%d] > %s: pic: %s->%s, aic: %s->%s, state: %s->%s"
+
+# pci-mirror.c
+pci_mirror_init(const char *dev, uint8_t mirror_bar, uint8_t target_bar, uint64_t size, uint64_t offset, uint64_t poll_ns) "%s: mirror BAR%u -> target BAR%u, size=0x%"PRIx64", offset=0x%"PRIx64", poll=%"PRIu64"ns"
+pci_mirror_cleanup(const char *dev) "%s: cleaning up mirror"
+pci_mirror_reset(const char *dev) "%s: resetting mirror statistics"
+pci_mirror_dma_write_detected(const char *dev, uint64_t offset, uint64_t value) "%s: DMA write detected offset=0x%"PRIx64" value=0x%"PRIx64
+pci_mirror_forward_write(const char *dev, uint64_t target_offset, uint64_t value, unsigned size) "%s: forward write to target offset=0x%"PRIx64" value=0x%"PRIx64" size=%u"
+pci_mirror_forward_error(const char *dev, uint64_t offset, int result) "%s: forward error offset=0x%"PRIx64" result=%d"
+pci_mirror_bounds_error(const char *dev, const char *op, uint64_t addr, unsigned size, uint64_t limit) "%s: bounds error %s addr=0x%"PRIx64" size=%u limit=0x%"PRIx64
+pci_mirror_poll_cycle(const char *dev, uint64_t forwards, uint64_t errors) "%s: poll cycle complete forwards=%"PRIu64" errors=%"PRIu64

@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci_mirror.h"
 #include "hw/qdev-properties.h"
 #include "qemu/event_notifier.h"
 #include "qemu/module.h"
@@ -92,6 +93,8 @@ struct PCITestDevState {
     uint64_t membar_size;
     bool membar_backed;
     MemoryRegion membar;
+
+    PCIMirrorState mirror;
 };
 
 #define TYPE_PCI_TEST_DEV "pci-testdev"
@@ -302,6 +305,13 @@ static void pci_testdev_realize(PCIDevice *pci_dev, Error **errp)
         assert(r >= 0);
         test->hasnotifier = true;
     }
+
+    /* Initialize generic PCI mirror if enabled */
+    if (d->mirror.enabled) {
+        if (pci_mirror_init(pci_dev, &d->mirror, &d->mmio, errp) < 0) {
+            return;
+        }
+    }
 }
 
 static void
@@ -318,17 +328,28 @@ pci_testdev_uninit(PCIDevice *dev)
         g_free(d->tests[i].hdr);
     }
     g_free(d->tests);
+
+    /* Cleanup generic PCI mirror */
+    if (d->mirror.enabled) {
+        pci_mirror_cleanup(&d->mirror);
+    }
 }
 
 static void qdev_pci_testdev_reset(DeviceState *dev)
 {
     PCITestDevState *d = PCI_TEST_DEV(dev);
     pci_testdev_reset(d);
+
+    /* Reset generic PCI mirror statistics */
+    if (d->mirror.enabled) {
+        pci_mirror_reset(&d->mirror);
+    }
 }
 
 static const Property pci_testdev_properties[] = {
     DEFINE_PROP_SIZE("membar", PCITestDevState, membar_size, 0),
     DEFINE_PROP_BOOL("membar-backed", PCITestDevState, membar_backed, false),
+    DEFINE_PCI_MIRROR_PROPERTIES(PCITestDevState, mirror)
 };
 
 static void pci_testdev_class_init(ObjectClass *klass, const void *data)
