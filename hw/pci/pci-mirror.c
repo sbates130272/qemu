@@ -228,10 +228,8 @@ void pci_mirror_cleanup(PCIMirrorState *mirror)
     }
 
     /* Free RAM backing */
-    if (mirror->ram) {
-        g_free(mirror->ram);
-        mirror->ram = NULL;
-    }
+    g_free(mirror->ram);
+    mirror->ram = NULL;
 }
 
 /*

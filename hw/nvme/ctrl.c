@@ -9009,6 +9009,13 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
 
         n->subsys->namespaces[ns->params.nsid] = ns;
     }
+
+    /* Initialize mirror if enabled */
+    if (n->mirror.enabled) {
+        if (pci_mirror_init(pci_dev, &n->mirror, &n->iomem, errp) < 0) {
+            return;
+        }
+    }
 }
 
 static void nvme_exit(PCIDevice *pci_dev)
@@ -9056,6 +9063,11 @@ static void nvme_exit(PCIDevice *pci_dev)
     }
 
     memory_region_del_subregion(&n->bar0, &n->iomem);
+
+    /* Cleanup mirror */
+    if (n->mirror.enabled) {
+        pci_mirror_cleanup(&n->mirror);
+    }
 }
 
 static const Property nvme_props[] = {
@@ -9098,6 +9110,7 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
     DEFINE_PROP_UINT16("atomic.awupf", NvmeCtrl, params.atomic_awupf, 0),
     DEFINE_PROP_BOOL("ocp", NvmeCtrl, params.ocp, false),
+    DEFINE_PCI_MIRROR_PROPERTIES(NvmeCtrl, mirror)
 };
 
 static void nvme_get_smart_warning(Object *obj, Visitor *v, const char *name,
@@ -9149,6 +9162,11 @@ static void nvme_pci_reset(DeviceState *qdev)
 
     trace_pci_nvme_pci_reset();
     nvme_ctrl_reset(n, NVME_RESET_FUNCTION);
+
+    /* Reset mirror statistics */
+    if (n->mirror.enabled) {
+        pci_mirror_reset(&n->mirror);
+    }
 }
 
 static void nvme_sriov_post_write_config(PCIDevice *dev, uint16_t old_num_vfs)

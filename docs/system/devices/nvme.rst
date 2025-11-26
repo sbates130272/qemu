@@ -60,6 +60,60 @@ parameters.
   the SMART / Health information extended log become available in the
   controller. We emulate version 5 of this log page.
 
+Mirror BAR (Optional)
+---------------------
+
+The NVMe device supports an optional RAM-backed "mirror" BAR that
+transparently forwards all accesses to BAR0 (the NVMe controller registers).
+This feature is particularly useful for VFIO scenarios where a device needs to
+perform DMA to trigger MMIO behavior in the emulated NVMe controller.
+
+The mirror BAR can be enabled using the following properties:
+
+``mirror-enabled=on`` (default: ``off``)
+  Enable the mirror BAR feature.
+
+``mirror-size=SIZE``
+  Size of the mirror BAR (must be power of 2). This should not exceed the size
+  of the target BAR (BAR0 is 16KB for NVMe).
+
+``mirror-bar-num=N`` (default: ``3``)
+  Mirror BAR number (0-5).
+
+``mirror-target-bar=N`` (default: ``0``)
+  Target BAR number to mirror (typically 0 for NVMe controller registers).
+
+``mirror-target-offset=N`` (default: ``0``)
+  Offset within the target BAR.
+
+``mirror-sync-reads=on|off`` (default: ``off``)
+  Synchronize reads from the target BAR to fetch current register values.
+
+``mirror-poll-interval=N`` (default: ``10000``)
+  Polling interval in nanoseconds.
+
+**Example Usage:**
+
+Basic configuration (mirror 4KB of NVMe controller registers):
+
+.. code-block:: console
+
+  -device nvme,serial=test,drive=nvm,mirror-enabled=on,mirror-size=4096
+
+Advanced configuration:
+
+.. code-block:: console
+
+  -device nvme,serial=test,drive=nvm,mirror-enabled=on,\
+          mirror-size=4096,mirror-target-bar=0,\
+          mirror-target-offset=0,mirror-poll-interval=10000
+
+**Use Cases:**
+
+- VFIO device performing DMA to trigger NVMe controller behavior
+- Device-to-device communication in virtualized environments
+- Testing and debugging PCI BAR mirroring infrastructure
+
 Additional Namespaces
 ---------------------
 

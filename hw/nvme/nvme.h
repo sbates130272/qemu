@@ -20,6 +20,7 @@
 
 #include "qemu/uuid.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci_mirror.h"
 #include "hw/block/block.h"
 
 #include "block/nvme.h"
@@ -648,6 +649,8 @@ typedef struct NvmeCtrl {
     } next_pri_ctrl_cap;    /* These override pri_ctrl_cap after reset */
     uint32_t    dn; /* Disable Normal */
     NvmeAtomic  atomic;
+
+    PCIMirrorState mirror;
 } NvmeCtrl;
 
 typedef enum NvmeResetType {
