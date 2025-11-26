@@ -559,6 +559,23 @@ typedef struct NvmeParams {
     bool     atomic_dn;
 } NvmeParams;
 
+typedef struct NvmeBridgeRegion {
+    volatile uint32_t magic;              /* 0x00: 0xDEADFEED */
+    volatile uint32_t sequence;           /* 0x04: Incremented by writer */
+    volatile uint32_t poll_count;         /* 0x08: QEMU poll counter */
+    volatile uint32_t last_sequence;      /* 0x0C: Last seen by QEMU */
+    volatile uint32_t cmd_magic;          /* 0x10: 0xDEADC0DE */
+    volatile uint8_t  cmd_bar;            /* 0x14: Target BAR number */
+    volatile uint8_t  cmd_size;           /* 0x15: Write size (1/2/4/8) */
+    volatile uint16_t cmd_status;         /* 0x16: Command status */
+    volatile uint64_t cmd_offset;         /* 0x18: Offset in target BAR */
+    volatile uint64_t cmd_data;           /* 0x20: Data to write */
+    volatile uint32_t cmd_exec_count;     /* 0x28: Commands executed */
+    volatile uint32_t cmd_error_code;     /* 0x2C: Error code */
+    volatile uint64_t cmd_completion_addr;/* 0x30: Completion GPA */
+    uint8_t padding[0xFC8];               /* Pad to 4KB */
+} QEMU_PACKED NvmeBridgeRegion;
+
 typedef struct NvmeCtrl {
     PCIDevice    parent_obj;
     MemoryRegion bar0;
@@ -648,6 +665,18 @@ typedef struct NvmeCtrl {
     } next_pri_ctrl_cap;    /* These override pri_ctrl_cap after reset */
     uint32_t    dn; /* Disable Normal */
     NvmeAtomic  atomic;
+
+    /* BAR3 MMIO Bridge - optional feature */
+    struct {
+        bool enabled;
+        uint64_t size;
+        uint64_t poll_interval;
+        MemoryRegion bar;
+        void *ram;
+        QEMUTimer *timer;
+        uint32_t last_sequence;
+        bool enable_mmio_bridge;
+    } bridge;
 } NvmeCtrl;
 
 typedef enum NvmeResetType {

@@ -204,6 +204,7 @@
 #include "system/system.h"
 #include "system/block-backend.h"
 #include "system/hostmem.h"
+#include "system/address-spaces.h"
 #include "hw/pci/msix.h"
 #include "hw/pci/pcie_sriov.h"
 #include "system/spdm-socket.h"
@@ -223,6 +224,19 @@
 #define NVME_TEMPERATURE_CRITICAL 0x175
 #define NVME_NUM_FW_SLOTS 1
 #define NVME_DEFAULT_MAX_ZA_SIZE (128 * KiB)
+
+/* BAR3 Bridge definitions */
+#define NVME_BRIDGE_MAGIC        0xDEADFEED
+#define NVME_BRIDGE_CMD_MAGIC    0xDEADC0DE
+#define NVME_BRIDGE_STATUS_PENDING  0
+#define NVME_BRIDGE_STATUS_SUCCESS  1
+#define NVME_BRIDGE_STATUS_ERROR    2
+#define NVME_BRIDGE_ERR_NONE            0
+#define NVME_BRIDGE_ERR_INVALID_BAR     1
+#define NVME_BRIDGE_ERR_INVALID_SIZE    2
+#define NVME_BRIDGE_ERR_OUT_OF_RANGE    3
+#define NVME_BRIDGE_ERR_MMIO_FAILED     4
+#define NVME_BRIDGE_COMPLETION_MAGIC  0xDEADBEEFC0DEC0DEULL
 #define NVME_VF_RES_GRANULARITY 1
 #define NVME_VF_OFFSET 0x1
 #define NVME_VF_STRIDE 1
@@ -8512,6 +8526,152 @@ static void nvme_init_state(NvmeCtrl *n)
     }
 }
 
+/*
+ * BAR3 Bridge - Execute MMIO command
+ */
+static void nvme_bridge_execute_mmio(NvmeCtrl *n, NvmeBridgeRegion *region)
+{
+    MemoryRegion *target_mr = NULL;
+    MemTxResult result;
+    uint64_t completion = NVME_BRIDGE_COMPLETION_MAGIC;
+    uint64_t bar0_size;
+
+    /* Validate BAR number (only BAR0 supported) */
+    if (region->cmd_bar != 0) {
+        region->cmd_error_code = NVME_BRIDGE_ERR_INVALID_BAR;
+        region->cmd_status = NVME_BRIDGE_STATUS_ERROR;
+        return;
+    }
+
+    /* Validate size */
+    if (region->cmd_size != 1 && region->cmd_size != 2 &&
+        region->cmd_size != 4 && region->cmd_size != 8) {
+        region->cmd_error_code = NVME_BRIDGE_ERR_INVALID_SIZE;
+        region->cmd_status = NVME_BRIDGE_STATUS_ERROR;
+        return;
+    }
+
+    /* Get BAR0 memory region */
+    target_mr = &n->iomem;
+    bar0_size = memory_region_size(target_mr);
+
+    /* Validate offset */
+    if (region->cmd_offset + region->cmd_size > bar0_size) {
+        region->cmd_error_code = NVME_BRIDGE_ERR_OUT_OF_RANGE;
+        region->cmd_status = NVME_BRIDGE_STATUS_ERROR;
+        return;
+    }
+
+    /* Execute MMIO write to BAR0 */
+    result = memory_region_dispatch_write(target_mr,
+                                         region->cmd_offset,
+                                         region->cmd_data,
+                                         size_memop(region->cmd_size),
+                                         MEMTXATTRS_UNSPECIFIED);
+
+    if (result == MEMTX_OK) {
+        region->cmd_exec_count++;
+        region->cmd_status = NVME_BRIDGE_STATUS_SUCCESS;
+        region->cmd_error_code = NVME_BRIDGE_ERR_NONE;
+
+        /* Write completion magic if requested */
+        if (region->cmd_completion_addr != 0) {
+            address_space_write(&address_space_memory,
+                              region->cmd_completion_addr,
+                              MEMTXATTRS_UNSPECIFIED,
+                              &completion, sizeof(completion));
+        }
+    } else {
+        region->cmd_error_code = NVME_BRIDGE_ERR_MMIO_FAILED;
+        region->cmd_status = NVME_BRIDGE_STATUS_ERROR;
+    }
+}
+
+/*
+ * BAR3 Bridge - Polling callback
+ */
+static void nvme_bridge_poll(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+    NvmeBridgeRegion *region = (NvmeBridgeRegion *)n->bridge.ram;
+    uint32_t current_seq, cmd_magic;
+
+    /* Read sequence number */
+    current_seq = qatomic_read(&region->sequence);
+
+    /* Check if sequence changed */
+    if (current_seq != n->bridge.last_sequence) {
+        cmd_magic = qatomic_read(&region->cmd_magic);
+
+        /* Validate magic values and execute if MMIO bridge enabled */
+        if (region->magic == NVME_BRIDGE_MAGIC &&
+            n->bridge.enable_mmio_bridge &&
+            cmd_magic == NVME_BRIDGE_CMD_MAGIC) {
+            nvme_bridge_execute_mmio(n, region);
+        }
+
+        n->bridge.last_sequence = current_seq;
+        region->poll_count++;
+    }
+
+    /* Re-arm timer */
+    timer_mod(n->bridge.timer,
+             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+             n->bridge.poll_interval);
+}
+
+/*
+ * BAR3 Bridge - Initialize
+ */
+static void nvme_init_bridge_bar(NvmeCtrl *n, PCIDevice *pci_dev,
+                                  Error **errp)
+{
+    ERRP_GUARD();
+
+    /* Validate size */
+    if (n->bridge.size < 4096) {
+        error_setg(errp, "bridge-bar-size must be at least 4KB");
+        return;
+    }
+
+    /* Validate poll interval */
+    if (n->bridge.poll_interval == 0) {
+        n->bridge.poll_interval = 10000;  /* Default 10μs */
+    }
+
+    if (n->bridge.poll_interval < 1000) {
+        error_setg(errp, "bridge-poll-interval must be at least 1000ns");
+        return;
+    }
+
+    /* Initialize RAM-backed memory region */
+    memory_region_init_ram(&n->bridge.bar, OBJECT(n),
+                          "nvme-bridge-bar3",
+                          n->bridge.size, errp);
+    if (*errp) {
+        return;
+    }
+
+    /* Get pointer to the RAM backing */
+    n->bridge.ram = memory_region_get_ram_ptr(&n->bridge.bar);
+
+    /* Register BAR3 */
+    pci_register_bar(pci_dev, 3,
+                    PCI_BASE_ADDRESS_SPACE_MEMORY |
+                    PCI_BASE_ADDRESS_MEM_PREFETCH |
+                    PCI_BASE_ADDRESS_MEM_TYPE_64,
+                    &n->bridge.bar);
+
+    /* Setup polling timer */
+    n->bridge.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  nvme_bridge_poll, n);
+    timer_mod(n->bridge.timer,
+             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+             n->bridge.poll_interval);
+
+    n->bridge.enabled = true;
+}
+
 static void nvme_init_cmb(NvmeCtrl *n, PCIDevice *pci_dev)
 {
     uint64_t cmb_size = n->params.cmb_size_mb * MiB;
@@ -8753,6 +8913,14 @@ static bool nvme_init_pci(NvmeCtrl *n, PCIDevice *pci_dev, Error **errp)
 
     if (n->params.cmb_size_mb) {
         nvme_init_cmb(n, pci_dev);
+    }
+
+    /* Setup BAR3 MMIO Bridge if requested */
+    if (n->bridge.size) {
+        nvme_init_bridge_bar(n, pci_dev, errp);
+        if (*errp) {
+            return false;
+        }
     }
 
     if (n->pmr.dev) {
@@ -9017,6 +9185,14 @@ static void nvme_exit(PCIDevice *pci_dev)
     NvmeNamespace *ns;
     int i;
 
+    /* Cleanup bridge resources */
+    if (n->bridge.enabled) {
+        if (n->bridge.timer) {
+            timer_free(n->bridge.timer);
+        }
+        /* RAM is managed by memory region, no need to free */
+    }
+
     nvme_ctrl_reset(n, NVME_RESET_FUNCTION);
 
     for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
@@ -9098,6 +9274,11 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
     DEFINE_PROP_UINT16("atomic.awupf", NvmeCtrl, params.atomic_awupf, 0),
     DEFINE_PROP_BOOL("ocp", NvmeCtrl, params.ocp, false),
+    DEFINE_PROP_SIZE("bridge-bar-size", NvmeCtrl, bridge.size, 0),
+    DEFINE_PROP_UINT64("bridge-poll-interval", NvmeCtrl,
+                       bridge.poll_interval, 10000),
+    DEFINE_PROP_BOOL("bridge-mmio", NvmeCtrl,
+                     bridge.enable_mmio_bridge, false),
 };
 
 static void nvme_get_smart_warning(Object *obj, Visitor *v, const char *name,

@@ -376,3 +376,155 @@ controller are:
 .. code-block:: console
 
    echo 0000:01:00.1 > /sys/bus/pci/drivers/nvme/bind
+
+BAR3 MMIO Bridge (Experimental)
+================================
+
+The NVMe controller supports an optional BAR3 region that provides a
+RAM-backed command interface allowing external devices (e.g., Smart NICs,
+FPGA accelerators) to trigger MMIO writes to the NVMe controller's BAR0
+registers. This feature is disabled by default and must be explicitly enabled.
+
+Overview
+--------
+
+This feature enables device-to-device interaction scenarios such as:
+
+* Smart NIC directly ringing NVMe submission queue doorbells
+* FPGA accelerators triggering NVMe operations
+* Multi-device coordination without CPU intervention
+* Testing complex DMA-triggered workflows
+
+The BAR3 region uses a polling-based mechanism where QEMU periodically
+checks for command updates written by external devices via DMA.
+
+Configuration
+-------------
+
+Enable the BAR3 bridge with the following parameters:
+
+``bridge-bar-size`` (default: ``0``, disabled)
+  Size of the BAR3 region. Must be at least 4KB. Setting this to a non-zero
+  value enables the feature.
+
+``bridge-poll-interval`` (default: ``10000``, 10μs)
+  Polling interval in nanoseconds. Must be at least 1000ns (1μs). Lower
+  values reduce latency but increase CPU overhead.
+
+``bridge-mmio`` (default: ``off``)
+  Enable MMIO command dispatch. When enabled, commands written to BAR3
+  will trigger MMIO writes to BAR0.
+
+Example
+-------
+
+Enable BAR3 bridge with 4KB size and 10μs polling:
+
+.. code-block:: console
+
+   -device nvme,serial=deadbeef,drive=nvme0,\
+   bridge-bar-size=4K,bridge-mmio=on,bridge-poll-interval=10000
+
+Protocol
+--------
+
+The BAR3 region has the following layout:
+
+.. code-block:: c
+
+  Offset  Size  Field              Access  Description
+  0x000   4     magic              RW      0xDEADFEED for validity
+  0x004   4     sequence           RW      Incremented by writer
+  0x008   4     poll_count         RO      QEMU poll counter
+  0x00C   4     last_sequence      RO      Last sequence seen
+  0x010   4     cmd_magic          RW      0xDEADC0DE for commands
+  0x014   1     cmd_bar            RW      Target BAR number (0=BAR0)
+  0x015   1     cmd_size           RW      Write size (1/2/4/8 bytes)
+  0x016   2     cmd_status         RO      Command status
+  0x018   8     cmd_offset         RW      Offset in target BAR
+  0x020   8     cmd_data           RW      Data to write
+  0x028   4     cmd_exec_count     RO      Commands executed
+  0x02C   4     cmd_error_code     RO      Error code
+  0x030   8     cmd_completion_addr RW     Completion notification GPA
+
+To trigger an MMIO write to BAR0:
+
+1. Write ``0xDEADFEED`` to ``magic``
+2. Write ``0xDEADC0DE`` to ``cmd_magic``
+3. Set ``cmd_bar`` to ``0`` (BAR0)
+4. Set ``cmd_size`` to ``1``, ``2``, ``4``, or ``8``
+5. Set ``cmd_offset`` to the offset within BAR0
+6. Set ``cmd_data`` to the value to write
+7. Optionally set ``cmd_completion_addr`` to receive completion notification
+8. Increment ``sequence``
+
+QEMU will detect the sequence change, validate the command, execute the
+MMIO write, and update ``cmd_status`` and ``cmd_exec_count``. If
+``cmd_completion_addr`` is non-zero, a 64-bit magic value
+(``0xDEADBEEFC0DEC0DE``) will be written there upon completion.
+
+Status Codes
+------------
+
+``cmd_status`` values:
+
+* ``0``: Pending
+* ``1``: Success
+* ``2``: Error (see ``cmd_error_code``)
+
+``cmd_error_code`` values:
+
+* ``0``: No error
+* ``1``: Invalid BAR number
+* ``2``: Invalid size
+* ``3``: Offset out of range
+* ``4``: MMIO write failed
+
+Performance
+-----------
+
+The polling mechanism introduces a fixed CPU overhead (typically 1-2% of one
+core) when enabled. Latency is bounded by the polling interval:
+
+* Best-case latency: poll_interval
+* Worst-case latency: 2 × poll_interval
+* Throughput: ~100K commands/second
+
+For testing and validation workloads, this performance is typically sufficient.
+The feature is not recommended for production use cases requiring ultra-low
+latency.
+
+Use Cases
+---------
+
+Typical use cases include:
+
+* **Smart NIC Development**: Testing NIC-to-NVMe communication patterns
+* **FPGA Integration**: Validating accelerator-to-storage workflows
+* **Multi-Device Testing**: Complex device interaction scenarios
+* **Research**: Studying DMA-triggered operation patterns
+
+Limitations
+-----------
+
+* Only BAR0 (NVMe MMIO registers) is currently supported as a target
+* Single command execution per poll cycle
+* Polling-based (not interrupt-driven)
+* Experimental feature, subject to change
+
+Testing
+-------
+
+A QTest suite is provided in ``tests/qtest/nvme-bridge-test.c`` covering:
+
+* BAR3 initialization
+* Sequence detection
+* MMIO command execution
+* Error handling
+* Disabled mode verification
+
+Run with:
+
+.. code-block:: console
+
+   make check-qtest-x86_64
