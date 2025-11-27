@@ -28,3 +28,14 @@ pcie_cap_slot_write_config(const char *parent, const char *child, const char *pd
 
 # shpc.c
 shpc_slot_command(const char *parent, int pci_slot, const char *child, const char *old_pic, const char *new_pic, const char *old_aic, const char *new_aic, const char *old_state, const char *new_state) "%s[%d] > %s: pic: %s->%s, aic: %s->%s, state: %s->%s"
+
+# pci-command-bridge.c
+pci_command_bridge_init(const char *dev, uint8_t bar, uint64_t size, uint64_t poll_ns) "%s: command bridge BAR%u, size=0x%"PRIx64", poll=%"PRIu64"ns"
+pci_command_bridge_cleanup(const char *dev) "%s: cleaning up command bridge"
+pci_command_bridge_reset(const char *dev) "%s: resetting command bridge"
+pci_command_bridge_dma_write_detected(const char *dev, uint32_t seq, uint32_t count) "%s: DMA write detected seq=%u count=%u"
+pci_command_bridge_execute_start(const char *dev, uint8_t bar, uint64_t offset, uint8_t size, uint64_t data) "%s: executing command BAR%u offset=0x%"PRIx64" size=%u data=0x%"PRIx64
+pci_command_bridge_execute_success(const char *dev, uint8_t bar, uint64_t offset, uint32_t count) "%s: command success BAR%u offset=0x%"PRIx64" exec_count=%u"
+pci_command_bridge_error(const char *dev, const char *msg, uint32_t error_code) "%s: error: %s (code=%u)"
+pci_command_bridge_read_result(const char *dev, uint64_t addr, uint64_t value) "%s: read result to 0x%"PRIx64" value=0x%"PRIx64
+pci_command_bridge_completion(const char *dev, uint64_t addr, uint64_t magic) "%s: completion write to 0x%"PRIx64" magic=0x%"PRIx64

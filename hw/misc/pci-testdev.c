@@ -20,12 +20,14 @@
 
 #include "qemu/osdep.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci_command_bridge.h"
 #include "hw/qdev-properties.h"
 #include "qemu/event_notifier.h"
 #include "qemu/module.h"
 #include "system/kvm.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "system/address-spaces.h"
 
 typedef struct PCITestDevHdr {
     uint8_t test;
@@ -80,27 +82,56 @@ enum {
 #define IOTEST_ACCESS_TYPE uint8_t
 #define IOTEST_ACCESS_WIDTH (sizeof(uint8_t))
 
+/* DMA command bridge is now provided by generic pci_command_bridge.h */
+
 /*
- * DMA Target BAR Protocol
- * This region is RAM-backed so VFIO devices can DMA to it.
- * QEMU polls this region to detect DMA writes.
+ * Doorbell DMA Engine
+ * Provides a doorbell-based DMA descriptor mechanism in BAR0
  */
-#define DMA_BAR_MAGIC_OFFSET    0x00
-#define DMA_BAR_SEQ_OFFSET      0x04
-#define DMA_BAR_POLL_CNT_OFFSET 0x08
-#define DMA_BAR_LAST_SEQ_OFFSET 0x0C
-#define DMA_BAR_DATA_OFFSET     0x10
+#define DOORBELL_OFFSET         0x100  /* Doorbell register base */
+#define DOORBELL_REG            0x100  /* Doorbell: write descriptor GPA */
+#define DOORBELL_STATUS         0x108  /* Status register (RO) */
+#define DOORBELL_ERROR          0x10C  /* Error code (RO) */
+#define DOORBELL_READ_COUNT     0x110  /* READ operation counter (RO) */
+#define DOORBELL_WRITE_COUNT    0x114  /* WRITE operation counter (RO) */
+#define DOORBELL_FILL_COUNT     0x118  /* FILL operation counter (RO) */
+#define DOORBELL_ERROR_COUNT    0x11C  /* Error counter (RO) */
 
-#define DMA_BAR_MAGIC_VALUE     0xDEADBEEF
-#define DMA_BAR_MIN_SIZE        0x1000  /* 4KB minimum */
+#define DOORBELL_DESC_MAGIC     0xDEADBELL  /* Descriptor magic */
+#define DOORBELL_COMPLETION_MAGIC 0xDEADBEEFC0DEC0DEULL  /* Completion magic */
 
-typedef struct DMATargetRegion {
-    volatile uint32_t magic;         /* Magic value for validity */
-    volatile uint32_t sequence;      /* Sequence number from DMA writer */
-    volatile uint32_t poll_count;    /* Number of times QEMU detected changes */
-    volatile uint32_t last_sequence; /* Last sequence QEMU saw */
-    uint8_t data[];                  /* Additional data area */
-} DMATargetRegion;
+/* Doorbell opcodes */
+#define DOORBELL_OP_NOP         0
+#define DOORBELL_OP_READ        1
+#define DOORBELL_OP_WRITE       2
+#define DOORBELL_OP_FILL        3
+
+/* Doorbell status codes */
+#define DOORBELL_STATUS_IDLE    0
+#define DOORBELL_STATUS_BUSY    1
+#define DOORBELL_STATUS_DONE    2
+
+/* Doorbell error codes */
+#define DOORBELL_ERR_NONE               0
+#define DOORBELL_ERR_INVALID_MAGIC      1
+#define DOORBELL_ERR_INVALID_OPCODE     2
+#define DOORBELL_ERR_INVALID_LENGTH     3
+#define DOORBELL_ERR_INVALID_ALIGNMENT  4
+#define DOORBELL_ERR_DMA_READ_FAILED    5
+#define DOORBELL_ERR_DMA_OP_FAILED      6
+
+typedef struct DMADescriptor {
+    uint32_t magic;             /* 0x00: 0xDEADBELL for validation */
+    uint8_t  opcode;            /* 0x04: Operation code */
+    uint8_t  flags;             /* 0x05: Reserved */
+    uint16_t reserved;          /* 0x06: Reserved */
+    uint64_t address;           /* 0x08: Guest physical address */
+    uint32_t length;            /* 0x10: Number of bytes */
+    uint32_t data;              /* 0x14: For FILL: pattern */
+    uint64_t completion_addr;   /* 0x18: Where to write completion magic */
+} QEMU_PACKED DMADescriptor;
+
+/* DMATargetRegion is now provided by pci_command_bridge.h as PCICommandRegion */
 
 struct PCITestDevState {
     /*< private >*/
@@ -116,11 +147,20 @@ struct PCITestDevState {
     bool membar_backed;
     MemoryRegion membar;
 
-    /* DMA target BAR with polling */
-    uint64_t dma_bar_size;
-    uint64_t dma_poll_interval;  /* nanoseconds */
-    MemoryRegion dma_bar;
-    QEMUTimer *dma_poll_timer;
+    /* Generic PCI command bridge */
+    PCICommandBridgeState cmd_bridge;
+
+    /* Doorbell DMA engine */
+    bool doorbell_enabled;
+    uint64_t doorbell_max_length;  /* Maximum transfer size */
+    uint32_t doorbell_status;      /* Current status */
+    uint32_t doorbell_error;       /* Last error code */
+    uint32_t doorbell_read_count;  /* Completed READ operations */
+    uint32_t doorbell_write_count; /* Completed WRITE operations */
+    uint32_t doorbell_fill_count;  /* Completed FILL operations */
+    uint32_t doorbell_error_count; /* Failed operations */
+    uint8_t *doorbell_buffer;      /* Internal buffer for operations */
+    uint64_t doorbell_gpa;         /* Accumulated doorbell GPA */
 };
 
 #define TYPE_PCI_TEST_DEV "pci-testdev"
@@ -178,6 +218,132 @@ static void pci_testdev_inc(IOTest *test, unsigned inc)
     test->hdr->count = cpu_to_le32(c + inc);
 }
 
+/*
+ * Execute a doorbell DMA operation
+ * Called when guest writes a descriptor GPA to the doorbell register
+ */
+static void pci_testdev_doorbell_execute(PCITestDevState *d, uint64_t desc_gpa)
+{
+    DMADescriptor desc;
+    MemTxResult result;
+    uint64_t completion_magic;
+    uint32_t i;
+
+    /* Set status to BUSY */
+    d->doorbell_status = DOORBELL_STATUS_BUSY;
+    d->doorbell_error = DOORBELL_ERR_NONE;
+
+    /* Read descriptor from guest memory */
+    result = address_space_read(&address_space_memory, desc_gpa,
+                               MEMTXATTRS_UNSPECIFIED,
+                               &desc, sizeof(desc));
+    if (result != MEMTX_OK) {
+        d->doorbell_error = DOORBELL_ERR_DMA_READ_FAILED;
+        goto done;
+    }
+
+    /* Convert fields from little-endian */
+    desc.magic = le32_to_cpu(desc.magic);
+    desc.address = le64_to_cpu(desc.address);
+    desc.length = le32_to_cpu(desc.length);
+    desc.data = le32_to_cpu(desc.data);
+    desc.completion_addr = le64_to_cpu(desc.completion_addr);
+
+    /* Validate magic */
+    if (desc.magic != DOORBELL_DESC_MAGIC) {
+        d->doorbell_error = DOORBELL_ERR_INVALID_MAGIC;
+        goto done;
+    }
+
+    /* Execute operation based on opcode */
+    switch (desc.opcode) {
+    case DOORBELL_OP_NOP:
+        /* No operation - just test the mechanism */
+        break;
+
+    case DOORBELL_OP_READ:
+        /* Validate length for READ */
+        if (desc.length == 0 || desc.length > d->doorbell_max_length) {
+            d->doorbell_error = DOORBELL_ERR_INVALID_LENGTH;
+            goto done;
+        }
+        /* Read from guest memory into internal buffer */
+        result = address_space_read(&address_space_memory, desc.address,
+                                   MEMTXATTRS_UNSPECIFIED,
+                                   d->doorbell_buffer, desc.length);
+        if (result != MEMTX_OK) {
+            d->doorbell_error = DOORBELL_ERR_DMA_OP_FAILED;
+            goto done;
+        }
+        d->doorbell_read_count++;
+        break;
+
+    case DOORBELL_OP_WRITE:
+        /* Validate length for WRITE */
+        if (desc.length == 0 || desc.length > d->doorbell_max_length) {
+            d->doorbell_error = DOORBELL_ERR_INVALID_LENGTH;
+            goto done;
+        }
+        /* Write test pattern to guest memory */
+        for (i = 0; i < desc.length; i++) {
+            d->doorbell_buffer[i] = (i & 0xFF);
+        }
+        result = address_space_write(&address_space_memory, desc.address,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    d->doorbell_buffer, desc.length);
+        if (result != MEMTX_OK) {
+            d->doorbell_error = DOORBELL_ERR_DMA_OP_FAILED;
+            goto done;
+        }
+        d->doorbell_write_count++;
+        break;
+
+    case DOORBELL_OP_FILL:
+        /* Validate length for FILL */
+        if (desc.length == 0 || desc.length > d->doorbell_max_length) {
+            d->doorbell_error = DOORBELL_ERR_INVALID_LENGTH;
+            goto done;
+        }
+        /* Fill guest memory with repeating 32-bit pattern */
+        for (i = 0; i < desc.length; i += 4) {
+            uint32_t pattern = cpu_to_le32(desc.data);
+            uint32_t copy_size = MIN(4, desc.length - i);
+            memcpy(&d->doorbell_buffer[i], &pattern, copy_size);
+        }
+        result = address_space_write(&address_space_memory, desc.address,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    d->doorbell_buffer, desc.length);
+        if (result != MEMTX_OK) {
+            d->doorbell_error = DOORBELL_ERR_DMA_OP_FAILED;
+            goto done;
+        }
+        d->doorbell_fill_count++;
+        break;
+
+    default:
+        d->doorbell_error = DOORBELL_ERR_INVALID_OPCODE;
+        goto done;
+    }
+
+done:
+    /* Update counters */
+    if (d->doorbell_error != DOORBELL_ERR_NONE) {
+        d->doorbell_error_count++;
+    }
+
+    /* Set status to DONE */
+    d->doorbell_status = DOORBELL_STATUS_DONE;
+
+    /* Write completion magic if requested (best effort) */
+    if (desc.completion_addr != 0) {
+        completion_magic = cpu_to_le64(DOORBELL_COMPLETION_MAGIC);
+        address_space_write(&address_space_memory, desc.completion_addr,
+                          MEMTXATTRS_UNSPECIFIED,
+                          &completion_magic, sizeof(completion_magic));
+        /* Ignore errors from completion write - operation already done */
+    }
+}
+
 static void
 pci_testdev_write(void *opaque, hwaddr addr, uint64_t val,
                   unsigned size, int type)
@@ -186,6 +352,34 @@ pci_testdev_write(void *opaque, hwaddr addr, uint64_t val,
     IOTest *test;
     int t, r;
 
+    /*
+     * Handle doorbell register write (0x100-0x107 for 8-byte value)
+     * Accumulate partial writes into 64-bit GPA
+     */
+    if (d->doorbell_enabled && addr >= DOORBELL_REG && addr < DOORBELL_STATUS) {
+        if (addr == DOORBELL_REG && (size == 4 || size == 8)) {
+            /* Lower 32 bits */
+            d->doorbell_gpa = (d->doorbell_gpa & 0xFFFFFFFF00000000ULL) |
+                             (val & 0xFFFFFFFFULL);
+            if (size == 8) {
+                /* Full 8-byte write - trigger immediately */
+                pci_testdev_doorbell_execute(d, val);
+            }
+        } else if (addr == (DOORBELL_REG + 4) && size == 4) {
+            /* Upper 32 bits - complete 64-bit write and trigger */
+            d->doorbell_gpa = (d->doorbell_gpa & 0xFFFFFFFFULL) |
+                             ((uint64_t)val << 32);
+            pci_testdev_doorbell_execute(d, d->doorbell_gpa);
+        }
+        return;
+    }
+
+    /* Doorbell registers are read-only (except doorbell itself) */
+    if (d->doorbell_enabled && addr >= DOORBELL_OFFSET && addr < 0x120) {
+        return;  /* Ignore writes to RO registers */
+    }
+
+    /* Original test device logic */
     if (addr == offsetof(PCITestDevHdr, test)) {
         pci_testdev_reset(d);
         if (val >= IOTEST_MAX_TEST) {
@@ -221,6 +415,35 @@ pci_testdev_read(void *opaque, hwaddr addr, unsigned size)
     PCITestDevState *d = opaque;
     const char *buf;
     IOTest *test;
+
+    /* Handle doorbell registers (0x100-0x11F) */
+    if (d->doorbell_enabled && addr >= DOORBELL_OFFSET && addr < 0x120) {
+        /* Handle 4-byte aligned reads for the registers */
+        if (size == 4 || size == 1) {
+            switch (addr) {
+            case DOORBELL_REG:
+            case DOORBELL_REG + 4:
+                return 0;  /* Doorbell is write-only */
+            case DOORBELL_STATUS:
+                return d->doorbell_status;
+            case DOORBELL_ERROR:
+                return d->doorbell_error;
+            case DOORBELL_READ_COUNT:
+                return d->doorbell_read_count;
+            case DOORBELL_WRITE_COUNT:
+                return d->doorbell_write_count;
+            case DOORBELL_FILL_COUNT:
+                return d->doorbell_fill_count;
+            case DOORBELL_ERROR_COUNT:
+                return d->doorbell_error_count;
+            default:
+                return 0;  /* Reserved */
+            }
+        }
+        return 0;
+    }
+
+    /* Original test device logic */
     if (d->current < 0) {
         return 0;
     }
@@ -255,7 +478,7 @@ static const MemoryRegionOps pci_testdev_mmio_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = {
         .min_access_size = 1,
-        .max_access_size = 1,
+        .max_access_size = 8,  /* Support 8-byte for doorbell */
     },
 };
 
@@ -273,67 +496,22 @@ static const MemoryRegionOps pci_testdev_pio_ops = {
  * Poll the DMA target BAR for changes
  * This detects when a VFIO device has written to the RAM-backed BAR
  */
-static void pci_testdev_dma_poll(void *opaque)
-{
-    PCITestDevState *d = PCI_TEST_DEV(opaque);
-    DMATargetRegion *dma_region;
-    uint32_t current_magic, current_seq, last_seq;
-
-    if (!d->dma_bar_size) {
-        return;
-    }
-
-    /* Get pointer to RAM backing the DMA BAR */
-    dma_region = (DMATargetRegion *)memory_region_get_ram_ptr(&d->dma_bar);
-
-    /* Read current values */
-    current_magic = qatomic_read(&dma_region->magic);
-    current_seq = qatomic_read(&dma_region->sequence);
-    last_seq = qatomic_read(&dma_region->last_sequence);
-
-    /*
-     * Detect write: valid magic and sequence number changed
-     * Note: Using volatile pointers and atomic reads to ensure we see
-     * DMA writes from VFIO devices (which bypass QEMU entirely)
-     */
-    if (current_magic == DMA_BAR_MAGIC_VALUE && current_seq != last_seq) {
-        uint32_t poll_count = qatomic_read(&dma_region->poll_count);
-
-        /* Update poll count and last sequence */
-        qatomic_set(&dma_region->poll_count, poll_count + 1);
-        qatomic_set(&dma_region->last_sequence, current_seq);
-    }
-
-    /* Re-arm timer */
-    timer_mod(d->dma_poll_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + d->dma_poll_interval);
-}
-
 /*
- * Initialize DMA target BAR
+ * BAR resolver callback for command bridge
  */
-static void pci_testdev_init_dma_bar(PCITestDevState *d, Error **errp)
+static MemoryRegion *pci_testdev_get_bar(PCIDevice *pci_dev, uint8_t bar_num)
 {
-    if (d->dma_bar_size < DMA_BAR_MIN_SIZE) {
-        error_setg(errp, "dma-bar-size must be at least %u bytes",
-                   DMA_BAR_MIN_SIZE);
-        return;
-    }
+    PCITestDevState *d = PCI_TEST_DEV(pci_dev);
 
-    /* Create RAM-backed region - use memory_region_init_ram instead */
-    memory_region_init_ram(&d->dma_bar, OBJECT(d),
-                          "pci-testdev-dma-target",
-                          d->dma_bar_size, errp);
-    if (*errp) {
-        return;
-    }
-
-    /* Set up polling timer */
-    d->dma_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                      pci_testdev_dma_poll, d);
-    if (d->dma_poll_interval > 0) {
-        timer_mod(d->dma_poll_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + d->dma_poll_interval);
+    switch (bar_num) {
+    case 0:
+        return &d->mmio;
+    case 1:
+        return &d->portio;
+    case 2:
+        return (d->membar_size > 0) ? &d->membar : NULL;
+    default:
+        return NULL;
     }
 }
 
@@ -343,17 +521,6 @@ static void pci_testdev_realize(PCIDevice *pci_dev, Error **errp)
     uint8_t *pci_conf;
     char *name;
     int r, i;
-
-    /* Validate DMA polling interval */
-    if (d->dma_bar_size && d->dma_poll_interval == 0) {
-        /* Default to 10μs polling interval */
-        d->dma_poll_interval = 10000;
-    }
-
-    if (d->dma_bar_size && d->dma_poll_interval < 1000) {
-        error_setg(errp, "dma-poll-interval must be at least 1000ns (1μs)");
-        return;
-    }
 
     pci_conf = pci_dev->config;
 
@@ -382,17 +549,24 @@ static void pci_testdev_realize(PCIDevice *pci_dev, Error **errp)
                          &d->membar);
     }
 
-    /* Set up DMA target BAR if requested */
-    if (d->dma_bar_size) {
-        pci_testdev_init_dma_bar(d, errp);
-        if (*errp) {
-            return;
+    /* Initialize generic PCI command bridge */
+    if (pci_command_bridge_init(pci_dev, &d->cmd_bridge,
+                                 pci_testdev_get_bar, errp) < 0) {
+        return;
+    }
+
+    /* Initialize doorbell DMA engine if enabled */
+    if (d->doorbell_enabled) {
+        if (d->doorbell_max_length == 0) {
+            d->doorbell_max_length = 4096;  /* Default 4KB */
         }
-        pci_register_bar(pci_dev, 3,
-                         PCI_BASE_ADDRESS_SPACE_MEMORY |
-                         PCI_BASE_ADDRESS_MEM_PREFETCH |
-                         PCI_BASE_ADDRESS_MEM_TYPE_64,
-                         &d->dma_bar);
+        d->doorbell_buffer = g_malloc0(d->doorbell_max_length);
+        d->doorbell_status = DOORBELL_STATUS_IDLE;
+        d->doorbell_error = DOORBELL_ERR_NONE;
+        d->doorbell_read_count = 0;
+        d->doorbell_write_count = 0;
+        d->doorbell_fill_count = 0;
+        d->doorbell_error_count = 0;
     }
 
     d->current = -1;
@@ -431,9 +605,12 @@ pci_testdev_uninit(PCIDevice *dev)
     PCITestDevState *d = PCI_TEST_DEV(dev);
     int i;
 
-    if (d->dma_poll_timer) {
-        timer_free(d->dma_poll_timer);
-        d->dma_poll_timer = NULL;
+    /* Clean up command bridge */
+    pci_command_bridge_cleanup(&d->cmd_bridge);
+
+    if (d->doorbell_buffer) {
+        g_free(d->doorbell_buffer);
+        d->doorbell_buffer = NULL;
     }
 
     pci_testdev_reset(d);
@@ -450,19 +627,33 @@ static void qdev_pci_testdev_reset(DeviceState *dev)
 {
     PCITestDevState *d = PCI_TEST_DEV(dev);
     pci_testdev_reset(d);
+
+    /* Reset command bridge */
+    pci_command_bridge_reset(&d->cmd_bridge);
+
+    /* Reset doorbell counters */
+    if (d->doorbell_enabled) {
+        d->doorbell_status = DOORBELL_STATUS_IDLE;
+        d->doorbell_error = DOORBELL_ERR_NONE;
+        d->doorbell_read_count = 0;
+        d->doorbell_write_count = 0;
+        d->doorbell_fill_count = 0;
+        d->doorbell_error_count = 0;
+    }
 }
 
 static const Property pci_testdev_properties[] = {
     DEFINE_PROP_SIZE("membar", PCITestDevState, membar_size, 0),
     DEFINE_PROP_BOOL("membar-backed", PCITestDevState, membar_backed, false),
-    DEFINE_PROP_SIZE("dma-bar-size", PCITestDevState, dma_bar_size, 0),
-    /*
-     * Polling interval in nanoseconds. Default 10000ns = 10μs.
-     * Lower values = lower latency but higher overhead.
-     * Set to 0 to disable automatic polling.
-     */
-    DEFINE_PROP_UINT64("dma-poll-interval", PCITestDevState,
-                       dma_poll_interval, 10000),
+    
+    /* Generic PCI command bridge properties */
+    DEFINE_PCI_COMMAND_BRIDGE_PROPERTIES(PCITestDevState, cmd_bridge),
+
+    /* Doorbell DMA engine properties */
+    DEFINE_PROP_BOOL("doorbell-dma", PCITestDevState,
+                     doorbell_enabled, false),
+    DEFINE_PROP_SIZE("doorbell-dma-max", PCITestDevState,
+                     doorbell_max_length, 4096),
 };
 
 static void pci_testdev_class_init(ObjectClass *klass, const void *data)
