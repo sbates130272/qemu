@@ -315,8 +315,9 @@ static void test_mmio_bridge_multiple(void)
          * The important part is that each command succeeds (status=SUCCESS)
          * and exec_count increases.
          */
-        g_assert(execute_command(dev, bar3, qts, 0, 1, BAR0_WIDTH_OFFSET,
-                                0x42 + i, &status, &error));
+        g_assert(execute_write_command(dev, bar3, qts, 0, 1,
+                                       BAR0_WIDTH_OFFSET, 0x42 + i,
+                                       &status, &error));
         g_assert_cmpuint(status, ==, DMA_CMD_STATUS_SUCCESS);
         g_assert_cmpuint(error, ==, 0);
     }
@@ -439,7 +440,7 @@ static void test_mmio_bridge_read_sizes(void)
     QTestState *qts;
     QPCIBus *pcibus;
     QPCIDevice *dev;
-    QPCIBar bar0, bar3;
+    QPCIBar bar3;
     uint16_t status;
     uint32_t error;
     uint64_t read_value;
@@ -452,7 +453,6 @@ static void test_mmio_bridge_read_sizes(void)
     g_assert_nonnull(dev);
     qpci_device_enable(dev);
 
-    bar0 = qpci_iomap(dev, 0, NULL);
     bar3 = qpci_iomap(dev, DMA_BAR_NUM, NULL);
 
     /* Initialize BAR3 */
