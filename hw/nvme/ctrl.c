@@ -8953,6 +8953,9 @@ void nvme_attach_ns(NvmeCtrl *n, NvmeNamespace *ns)
     ns->attached++;
 }
 
+/* Forward declaration for command bridge */
+static MemoryRegion *nvme_get_bar(PCIDevice *pci_dev, uint8_t bar_num);
+
 static void nvme_realize(PCIDevice *pci_dev, Error **errp)
 {
     NvmeCtrl *n = NVME(pci_dev);
@@ -9009,6 +9012,23 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
 
         n->subsys->namespaces[ns->params.nsid] = ns;
     }
+
+    /* Initialize generic PCI command bridge */
+    if (pci_command_bridge_init(pci_dev, &n->cmd_bridge,
+                                 nvme_get_bar, errp) < 0) {
+        return;
+    }
+}
+
+/* BAR resolver for command bridge */
+static MemoryRegion *nvme_get_bar(PCIDevice *pci_dev, uint8_t bar_num)
+{
+    NvmeCtrl *n = NVME(pci_dev);
+
+    if (bar_num == 0) {
+        return &n->iomem;
+    }
+    return NULL;
 }
 
 static void nvme_exit(PCIDevice *pci_dev)
@@ -9056,6 +9076,9 @@ static void nvme_exit(PCIDevice *pci_dev)
     }
 
     memory_region_del_subregion(&n->bar0, &n->iomem);
+    
+    /* Clean up command bridge */
+    pci_command_bridge_cleanup(&n->cmd_bridge);
 }
 
 static const Property nvme_props[] = {
@@ -9098,6 +9121,9 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
     DEFINE_PROP_UINT16("atomic.awupf", NvmeCtrl, params.atomic_awupf, 0),
     DEFINE_PROP_BOOL("ocp", NvmeCtrl, params.ocp, false),
+    
+    /* Generic PCI command bridge properties */
+    DEFINE_PCI_COMMAND_BRIDGE_PROPERTIES(NvmeCtrl, cmd_bridge),
 };
 
 static void nvme_get_smart_warning(Object *obj, Visitor *v, const char *name,
