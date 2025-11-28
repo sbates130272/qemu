@@ -1,0 +1,123 @@
+PCI MMIO Bridge - Quick Start Guide
+====================================
+
+The PCI MMIO bridge enables PCI devices to perform MMIO operations on
+other PCI devices via DMA-accessible command packets.
+
+QUICK START
+-----------
+
+1. Enable the bridge when starting QEMU:
+
+   qemu-system-x86_64 -M pc,pci-mmio-bridge-enabled=true \
+       -device nvme,serial=test \
+       -device vfio-pci,host=01:00.0
+
+2. In the guest, map the command queue:
+
+   void *queue = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED,
+                      mem_fd, 0x80000000);
+
+3. Submit a command:
+
+   struct pci_mmio_command cmd = {
+       .target_bdf = 0x0020,    // Target device (bus 0, dev 4, func 0)
+       .target_bar = 0,          // BAR 0
+       .offset = 0x1000,         // Offset within BAR
+       .value = 0x12345678,      // Value to write
+       .command = 1,             // WRITE command
+       .size = 4,                // 4 bytes
+       .status = 0,              // PENDING
+   };
+   
+   // Write command to queue
+   ((struct pci_mmio_command *)queue)[slot] = cmd;
+   wmb();
+   
+   // Update producer index
+   ((uint32_t *)queue)[0]++;
+   
+   // Wait for completion
+   while (((struct pci_mmio_command *)queue)[slot].status == 0)
+       cpu_relax();
+
+CONFIGURATION OPTIONS
+---------------------
+
+-M pc,pci-mmio-bridge-enabled=true
+   Enable the bridge
+
+-M pc,pci-mmio-bridge-gpa=0x80000000
+   Set guest physical address (default: 0x80000000)
+
+-M pc,pci-mmio-bridge-poll-interval=1000000
+   Set polling interval in nanoseconds (default: 1ms)
+
+COMMAND PACKET STRUCTURE
+-------------------------
+
+struct pci_mmio_command {
+    uint16_t target_bdf;    // Target device (bus<<8 | dev<<3 | func)
+    uint8_t  target_bar;    // Which BAR (0-5)
+    uint8_t  reserved1;
+    uint32_t offset;        // Offset within BAR
+    uint32_t value;         // Write value / read result
+    uint8_t  command;       // 0=NOP, 1=WRITE, 2=READ
+    uint8_t  size;          // 1, 2, 4, or 8 bytes
+    uint8_t  status;        // 0=pending, 1=complete, 2=error
+    uint8_t  reserved2;
+    uint32_t sequence;      // For ordering
+    uint32_t reserved3;
+};
+
+RING BUFFER LAYOUT
+------------------
+
+Offset  | Size | Content
+--------|------|--------------------------------------------------
+0x0000  | 24   | Ring metadata (producer_idx, consumer_idx, etc.)
+0x0018  | 24   | Command slot 0
+0x0030  | 24   | Command slot 1
+...     | ...  | ...
+0x0FF0  | 24   | Command slot 168 (total 169 slots in 4KB)
+
+EXAMPLE USE CASES
+-----------------
+
+1. GPU writes NVMe doorbell:
+   - Reduces CPU overhead for NVMe submission
+   - GPU directly triggers NVMe commands via DMA
+
+2. Multi-GPU synchronization:
+   - GPUs update each other's status registers
+   - No CPU involvement in GPU-to-GPU communication
+
+3. Accelerator chaining:
+   - FPGA → GPU → NVMe pipeline
+   - Each device triggers the next via MMIO
+
+DEBUGGING
+---------
+
+Enable trace events:
+
+   qemu-system-x86_64 -M pc,pci-mmio-bridge-enabled=true \
+       -trace pci_mmio_bridge_*
+
+Available traces:
+   - pci_mmio_bridge_init
+   - pci_mmio_bridge_command
+   - pci_mmio_bridge_write
+   - pci_mmio_bridge_read
+   - pci_mmio_bridge_*_error
+
+LIMITATIONS
+-----------
+
+- Only bus 0 supported (no multi-bus routing)
+- Polling-based (adds 0-1ms latency)
+- No security/access control
+- No interrupt-based completion
+
+For detailed documentation, see docs/system/devices/pci-mmio-bridge.rst
+

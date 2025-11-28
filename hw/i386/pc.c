@@ -48,6 +48,7 @@
 #include "hw/xen/xen.h"
 #include "qobject/qlist.h"
 #include "qemu/error-report.h"
+#include "hw/pci/pci-mmio-bridge.h"
 #include "hw/acpi/cpu_hotplug.h"
 #include "acpi-build.h"
 #include "hw/mem/nvdimm.h"
@@ -615,6 +616,17 @@ void pc_machine_done(Notifier *notifier, void *data)
 
     if (pcms->cxl_devices_state.is_enabled) {
         cxl_fmws_link_targets(&error_fatal);
+    }
+
+    /* Initialize PCI MMIO bridge if enabled */
+    if (pcms->pci_mmio_bridge_enabled && pcms->pcibus) {
+        hwaddr gpa = pcms->pci_mmio_bridge_gpa ? pcms->pci_mmio_bridge_gpa :
+                                                  0x80000000ULL;
+        pcms->pci_mmio_bridge = pci_mmio_bridge_init(
+            pcms->pcibus,
+            gpa, 4096,
+            pcms->pci_mmio_bridge_poll_interval,
+            &error_fatal);
     }
 
     /* set the number of CPUs */
@@ -1551,6 +1563,21 @@ static void pc_machine_set_i8042(Object *obj, bool value, Error **errp)
     pcms->i8042_enabled = value;
 }
 
+static bool pc_machine_get_pci_mmio_bridge_enabled(Object *obj, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return pcms->pci_mmio_bridge_enabled;
+}
+
+static void pc_machine_set_pci_mmio_bridge_enabled(Object *obj, bool value,
+                                                    Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    pcms->pci_mmio_bridge_enabled = value;
+}
+
 static bool pc_machine_get_default_bus_bypass_iommu(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
@@ -1685,6 +1712,11 @@ static void pc_machine_initfn(Object *obj)
 #endif
     pcms->fd_bootchk = true;
     pcms->default_bus_bypass_iommu = false;
+    
+    /* PCI MMIO Bridge - disabled by default */
+    pcms->pci_mmio_bridge_enabled = false;
+    pcms->pci_mmio_bridge_gpa = 0x80000000ULL;  /* Default GPA */
+    pcms->pci_mmio_bridge_poll_interval = 0;     /* Use default */
 
     pc_system_flash_create(pcms);
     pcms->pcspk = isa_new(TYPE_PC_SPEAKER);
@@ -1832,6 +1864,12 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "fd-bootchk",
         pc_machine_get_fd_bootchk,
         pc_machine_set_fd_bootchk);
+
+    object_class_property_add_bool(oc, "pci-mmio-bridge-enabled",
+        pc_machine_get_pci_mmio_bridge_enabled,
+        pc_machine_set_pci_mmio_bridge_enabled);
+    object_class_property_set_description(oc, "pci-mmio-bridge-enabled",
+        "Enable generic PCI MMIO bridge for device-to-device MMIO");
 
 #if defined(CONFIG_IGVM)
     object_class_property_add_link(oc, "igvm-cfg",

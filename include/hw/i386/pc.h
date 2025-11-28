@@ -37,6 +37,7 @@ typedef struct PCMachineState {
     ISADevice *pcspk;
     DeviceState *iommu;
     BusState *idebus[MAX_IDE_BUS];
+    struct PCIMMIOBridgeState *pci_mmio_bridge;
 
     /* Configuration options: */
     uint64_t max_ram_below_4g;
@@ -51,6 +52,11 @@ typedef struct PCMachineState {
     bool i8042_enabled;
     bool default_bus_bypass_iommu;
     bool fd_bootchk;
+    
+    /* PCI MMIO Bridge */
+    bool pci_mmio_bridge_enabled;
+    uint64_t pci_mmio_bridge_gpa;
+    uint64_t pci_mmio_bridge_poll_interval;
     uint64_t max_fw_size;
 
     /* ACPI Memory hotplug IO base address */
