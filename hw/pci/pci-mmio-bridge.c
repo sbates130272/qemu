@@ -209,8 +209,9 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
  * Polling timer callback
  *
  * Checks shadow buffer for new commands and processes them.
+ * This is exported for use by the PCI device wrapper.
  */
-static void pci_mmio_bridge_poll(void *opaque)
+void pci_mmio_bridge_poll(void *opaque)
 {
     PCIMMIOBridgeState *bridge = opaque;
     struct pci_mmio_ring_meta *meta;

@@ -136,5 +136,10 @@ void pci_mmio_bridge_get_stats(PCIMMIOBridgeState *bridge,
  */
 void pci_mmio_bridge_poll_once(PCIMMIOBridgeState *bridge);
 
+/*
+ * Internal polling callback (exposed for PCI device implementation)
+ */
+void pci_mmio_bridge_poll(void *opaque);
+
 #endif /* HW_PCI_MMIO_BRIDGE_H */
 

@@ -92,6 +92,7 @@ Emulated Devices
    devices/net.rst
    devices/nvme.rst
    devices/pci-mmio-bridge.rst
+   devices/pci-mmio-bridge-pci.rst
    devices/usb.rst
    devices/vhost-user.rst
    devices/virtio-gpu.rst

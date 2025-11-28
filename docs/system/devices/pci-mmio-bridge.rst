@@ -1,6 +1,13 @@
 PCI MMIO Bridge
 ===============
 
+.. note::
+   This document describes the machine-integrated version of the PCI MMIO
+   bridge. For new deployments, consider using the **PCI device version**
+   (see ``pci-mmio-bridge-pci.rst``), which provides automatic discovery
+   and follows PCI standards. Use this machine-integrated version only if
+   you need a fixed GPA or have specific backward compatibility requirements.
+
 The PCI MMIO bridge provides a device-agnostic mechanism for PCI devices
 to perform MMIO (Memory-Mapped I/O) operations on other PCI devices via
 DMA-accessible command packets. This enables software-defined PCIe

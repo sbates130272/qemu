@@ -43,3 +43,8 @@ pci_mmio_bridge_bar_not_mapped(uint16_t bdf, uint8_t bar) "BDF=%04x BAR=%u not m
 pci_mmio_bridge_invalid_command(uint8_t command) "invalid command=%u"
 pci_mmio_bridge_invalid_size(uint8_t size) "invalid size=%u"
 pci_mmio_bridge_poll_processed(uint32_t count) "processed %u commands"
+
+# pci-mmio-bridge-pci.c
+pci_mmio_bridge_pci_realize(uint32_t bar_size, uint32_t queue_depth) "bar_size=%u queue_depth=%u"
+pci_mmio_bridge_pci_exit(uint64_t commands, uint64_t writes, uint64_t reads, uint64_t errors) "commands=%"PRIu64" writes=%"PRIu64" reads=%"PRIu64" errors=%"PRIu64
+pci_mmio_bridge_pci_reset(void) "resetting bridge state"
