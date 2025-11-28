@@ -28,8 +28,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(PCIMMIOBridgePCIState, PCI_MMIO_BRIDGE_PCI)
  * PCI MMIO Bridge Device State
  *
  * This is the PCI device wrapper around the core bridge functionality.
- * It exposes the shadow buffer as BAR0, making it discoverable and
- * accessible via standard PCI mechanisms.
+ * Unlike a traditional PCI device, it allocates guest RAM (not MMIO)
+ * for the shadow buffer to enable VFIO DMA access. The guest physical
+ * address (GPA) is exposed via PCI config space vendor-specific registers.
  */
 struct PCIMMIOBridgePCIState {
     PCIDevice parent_obj;
@@ -37,13 +38,11 @@ struct PCIMMIOBridgePCIState {
     /* Core bridge state */
     PCIMMIOBridgeState *bridge;
 
-    /* PCI BAR for shadow buffer */
-    MemoryRegion bar;
-
     /* Configuration properties */
-    uint32_t bar_size;        /* Size of BAR0 (shadow buffer) */
+    uint64_t shadow_gpa;       /* Guest physical address (0 = auto) */
+    uint32_t shadow_size;      /* Size of shadow buffer */
     uint64_t poll_interval_ns; /* Polling interval */
-    bool enabled;             /* Whether bridge is active */
+    bool enabled;              /* Whether bridge is active */
 };
 
 #endif /* HW_PCI_MMIO_BRIDGE_PCI_H */

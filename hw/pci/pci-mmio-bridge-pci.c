@@ -3,6 +3,10 @@
  *
  * Exposes the generic PCI MMIO Bridge as a standard PCI device.
  *
+ * IMPORTANT: This device allocates guest RAM (not PCI MMIO) for the shadow
+ * buffer to enable VFIO DMA access. The GPA is exposed via vendor-specific
+ * PCI config space registers.
+ *
  * Copyright (c) 2024 Your Name
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
@@ -16,54 +20,23 @@
 #include "hw/resettable.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
-#include "qemu/memalign.h"
 #include "trace.h"
 
-/* Memory region operations for BAR0 (shadow buffer) */
-static void pci_mmio_bridge_bar_write(void *opaque, hwaddr addr,
-                                      uint64_t value, unsigned size)
-{
-    PCIMMIOBridgePCIState *s = opaque;
-    
-    /* Delegate to core bridge shadow write handler */
-    if (s->bridge && s->bridge->shadow_hva) {
-        memcpy(s->bridge->shadow_hva + addr, &value, size);
-        
-        /* Trigger immediate poll if writing to producer index */
-        if (addr < 4 && s->bridge->enabled && s->bridge->poll_bh) {
-            qemu_bh_schedule(s->bridge->poll_bh);
-        }
-    }
-}
-
-static uint64_t pci_mmio_bridge_bar_read(void *opaque, hwaddr addr,
-                                         unsigned size)
-{
-    PCIMMIOBridgePCIState *s = opaque;
-    uint64_t value = 0;
-    
-    if (s->bridge && s->bridge->shadow_hva) {
-        memcpy(&value, s->bridge->shadow_hva + addr, size);
-    }
-    
-    return value;
-}
-
-static const MemoryRegionOps pci_mmio_bridge_bar_ops = {
-    .read = pci_mmio_bridge_bar_read,
-    .write = pci_mmio_bridge_bar_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
+/*
+ * Vendor-specific capability offsets in PCI config space
+ * These expose the shadow buffer GPA and size to guest drivers
+ */
+#define PCI_MMIO_BRIDGE_CAP_OFFSET  0x40
+#define PCI_MMIO_BRIDGE_CAP_GPA_LO  0x00  /* Lower 32 bits of GPA */
+#define PCI_MMIO_BRIDGE_CAP_GPA_HI  0x04  /* Upper 32 bits of GPA */
+#define PCI_MMIO_BRIDGE_CAP_SIZE    0x08  /* Buffer size */
+#define PCI_MMIO_BRIDGE_CAP_DEPTH   0x0C  /* Queue depth */
 
 static void pci_mmio_bridge_pci_realize(PCIDevice *pci_dev, Error **errp)
 {
     PCIMMIOBridgePCIState *s = PCI_MMIO_BRIDGE_PCI(pci_dev);
     uint8_t *pci_conf = pci_dev->config;
-    struct pci_mmio_ring_meta *meta;
+    Error *local_err = NULL;
 
     /* Set PCI config space */
     pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_REDHAT_QEMU);
@@ -76,63 +49,46 @@ static void pci_mmio_bridge_pci_realize(PCIDevice *pci_dev, Error **errp)
                  PCI_VENDOR_ID_REDHAT_QEMU);
     pci_set_word(pci_conf + PCI_SUBSYSTEM_ID, 0x1100);
 
-    /* Validate bar_size */
-    if (s->bar_size < 4096) {
-        error_setg(errp, "bar-size must be at least 4096 bytes");
+    /* Validate shadow_size */
+    if (s->shadow_size < 4096) {
+        error_setg(errp, "shadow-size must be at least 4096 bytes");
         return;
     }
 
-    /* Allocate core bridge state */
-    s->bridge = g_new0(PCIMMIOBridgeState, 1);
-    
-    /* Store PCI bus reference */
-    s->bridge->pci_bus = pci_get_bus(pci_dev);
-    
-    /* Allocate shadow buffer backing memory */
-    s->bridge->shadow_hva = qemu_memalign(4096, s->bar_size);
-    memset(s->bridge->shadow_hva, 0, s->bar_size);
-    s->bridge->shadow_size = s->bar_size;
-    
-    /* Initialize BAR0 with custom ops */
-    memory_region_init_io(&s->bar, OBJECT(s), &pci_mmio_bridge_bar_ops,
-                          s, "pci-mmio-bridge-bar0", s->bar_size);
-    
-    /* Register BAR0 as a 32-bit memory BAR */
-    pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
-
-    /* Calculate queue depth */
-    s->bridge->queue_depth = 
-        (s->bar_size / sizeof(struct pci_mmio_command)) - 1;
-
-    /* Initialize ring buffer metadata in shadow buffer */
-    meta = (struct pci_mmio_ring_meta *)s->bridge->shadow_hva;
-    meta->producer_idx = 0;
-    meta->consumer_idx = 0;
-    meta->queue_depth = s->bridge->queue_depth;
-    meta->reserved = 0;
-
-    /* Initialize polling infrastructure */
-    s->bridge->poll_interval_ns = s->poll_interval_ns ? 
-                                   s->poll_interval_ns : 1000000;
-    
-    s->bridge->poll_bh = qemu_bh_new(pci_mmio_bridge_poll, s->bridge);
-    s->bridge->poll_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
-                                         pci_mmio_bridge_poll, s->bridge);
-    s->bridge->enabled = s->enabled;
-
-    /* Start polling if enabled */
-    if (s->enabled) {
-        timer_mod(s->bridge->poll_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 
-                  s->bridge->poll_interval_ns);
+    /* Default GPA if not specified (below 4GB for 32-bit compatibility) */
+    if (s->shadow_gpa == 0) {
+        s->shadow_gpa = 0x80000000ULL;  /* Default: 2GB mark */
     }
 
-    /* Get BAR address for tracing */
-    PCIIORegion *region = &pci_dev->io_regions[0];
-    s->bridge->shadow_gpa = region->addr != PCI_BAR_UNMAPPED ?
-                            region->addr : 0;
+    /* Use existing bridge initialization (creates guest RAM) */
+    s->bridge = pci_mmio_bridge_init(pci_get_bus(pci_dev),
+                                     s->shadow_gpa,
+                                     s->shadow_size,
+                                     s->poll_interval_ns,
+                                     &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
 
-    trace_pci_mmio_bridge_pci_realize(s->bar_size, s->bridge->queue_depth);
+    s->bridge->enabled = s->enabled;
+
+    /* Expose shadow buffer GPA and size via vendor-specific config space */
+    pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                 PCI_MMIO_BRIDGE_CAP_GPA_LO,
+                 (uint32_t)(s->shadow_gpa & 0xFFFFFFFF));
+    pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                 PCI_MMIO_BRIDGE_CAP_GPA_HI,
+                 (uint32_t)(s->shadow_gpa >> 32));
+    pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                 PCI_MMIO_BRIDGE_CAP_SIZE,
+                 s->shadow_size);
+    pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                 PCI_MMIO_BRIDGE_CAP_DEPTH,
+                 s->bridge->queue_depth);
+
+    trace_pci_mmio_bridge_pci_realize(s->shadow_gpa, s->shadow_size,
+                                      s->bridge->queue_depth);
 }
 
 static void pci_mmio_bridge_pci_exit(PCIDevice *pci_dev)
@@ -148,23 +104,8 @@ static void pci_mmio_bridge_pci_exit(PCIDevice *pci_dev)
                                    s->bridge->total_reads,
                                    s->bridge->total_errors);
 
-    /* Stop polling */
-    if (s->bridge->poll_timer) {
-        timer_free(s->bridge->poll_timer);
-        s->bridge->poll_timer = NULL;
-    }
-    if (s->bridge->poll_bh) {
-        qemu_bh_delete(s->bridge->poll_bh);
-        s->bridge->poll_bh = NULL;
-    }
-
-    /* Free shadow buffer */
-    if (s->bridge->shadow_hva) {
-        qemu_vfree(s->bridge->shadow_hva);
-        s->bridge->shadow_hva = NULL;
-    }
-
-    g_free(s->bridge);
+    /* Use bridge cleanup (handles guest RAM removal) */
+    pci_mmio_bridge_cleanup(s->bridge);
     s->bridge = NULL;
 }
 
@@ -177,7 +118,7 @@ static void pci_mmio_bridge_pci_reset(Object *obj, ResetType type)
         return;
     }
 
-    /* Reset ring buffer state */
+    /* Reset ring buffer state in guest RAM */
     meta = (struct pci_mmio_ring_meta *)s->bridge->shadow_hva;
     meta->producer_idx = 0;
     meta->consumer_idx = 0;
@@ -194,7 +135,9 @@ static void pci_mmio_bridge_pci_reset(Object *obj, ResetType type)
 }
 
 static const Property pci_mmio_bridge_pci_properties[] = {
-    DEFINE_PROP_UINT32("bar-size", PCIMMIOBridgePCIState, bar_size, 4096),
+    DEFINE_PROP_UINT64("shadow-gpa", PCIMMIOBridgePCIState, shadow_gpa, 0),
+    DEFINE_PROP_UINT32("shadow-size", PCIMMIOBridgePCIState, shadow_size, 
+                       4096),
     DEFINE_PROP_UINT64("poll-interval-ns", PCIMMIOBridgePCIState,
                        poll_interval_ns, 1000000),
     DEFINE_PROP_BOOL("enabled", PCIMMIOBridgePCIState, enabled, true)

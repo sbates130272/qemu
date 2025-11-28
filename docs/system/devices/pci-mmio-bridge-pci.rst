@@ -3,60 +3,90 @@ PCI MMIO Bridge (PCI Device)
 
 The PCI MMIO Bridge PCI device provides a discoverable, standards-compliant
 interface for device-to-device MMIO operations. It appears as a standard
-PCI device in the guest, making it easy to discover and use.
+PCI device in the guest, making it easy to discover.
+
+**IMPORTANT**: This device uses a **hybrid architecture** to support both
+guest discoverability AND VFIO DMA access:
+
+- PCI device for discovery (vendor 0x1b36, device 0x0010)
+- Shadow buffer allocated in **guest RAM** (not PCI MMIO space)
+- GPA exposed via PCI config space vendor-specific registers
+
+This architecture is critical because VFIO's Type-1 IOMMU can only map
+guest RAM, not PCI MMIO space.
 
 Overview
 --------
 
-The PCI MMIO Bridge device exposes the generic PCI MMIO Bridge functionality
-as a PCI device with:
+Architecture
+~~~~~~~~~~~~
+
+Unlike a traditional PCI device that exposes functionality via BARs, the
+PCI MMIO Bridge uses a hybrid model:
+
+1. **PCI Device**: Provides guest OS discovery via standard enumeration
+2. **Guest RAM**: Shadow buffer allocated as guest physical memory
+3. **Config Space**: Exposes shadow buffer GPA in vendor-specific registers
+4. **VFIO Compatible**: Shadow buffer can be mapped via `vfio_container_dma_map()`
+
+This design enables:
+
+- **Guest Discovery**: PCI enumeration finds the device automatically
+- **VFIO DMA**: Real hardware can DMA to shadow buffer (IOVA = GPA)
+- **Standard Drivers**: Guest uses normal PCI driver model
+
+Device Properties
+~~~~~~~~~~~~~~~~~
 
 - **Vendor ID**: 0x1b36 (Red Hat/QEMU)
 - **Device ID**: 0x0010 (PCI MMIO Bridge)
 - **Class**: 0x08/0x80 (System Other)
-- **BAR0**: Shadow buffer (command queue) - 4KB to 64KB configurable
-
-This makes the bridge:
-
-1. **Discoverable** - Visible in ``lspci`` and PCI enumeration
-2. **Standard** - Uses PCI config space and BARs
-3. **Flexible** - GPA assigned by PCI enumeration (or can be fixed)
-4. **Multiple** - Multiple bridges can coexist on the same VM
+- **Shadow Buffer**: Guest RAM at configurable GPA
+- **Config Space**: Vendor registers expose GPA/size/depth
 
 Guest Discovery
 ---------------
 
-Unlike the machine-integrated version, the PCI device is automatically
-discoverable by guest operating systems.
+PCI Enumeration
+~~~~~~~~~~~~~~~
 
-From Linux Guest
-~~~~~~~~~~~~~~~~
-
-Check for device:
+The device appears in standard PCI enumeration:
 
 .. code-block:: bash
 
-   # List all PCI devices
+   # Linux
    lspci
-   # Output includes:
+   # Output:
    # 00:04.0 System peripheral: Red Hat, Inc. Device 0010
 
-   # Get detailed info
    lspci -v -s 00:04.0
-   # Shows:
-   #   Region 0: Memory at <address> (32-bit, non-prefetchable) [size=4K]
+   # Shows PCI IDs but NO BARs (shadow buffer is in guest RAM)
 
-   # Read from sysfs
-   cat /sys/bus/pci/devices/0000:00:04.0/vendor  # Should show 0x1b36
-   cat /sys/bus/pci/devices/0000:00:04.0/device  # Should show 0x0010
+Reading Shadow Buffer Location
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-From Windows Guest
-~~~~~~~~~~~~~~~~~~
+Guest drivers read vendor-specific config space to find shadow buffer:
 
-The device appears in Device Manager under "System Devices" with:
+.. code-block:: c
 
-- Hardware ID: ``PCI\VEN_1B36&DEV_0010``
-- Compatible ID: ``PCI\CC_0880``
+   #define PCI_MMIO_BRIDGE_CAP_OFFSET  0x40
+   #define PCI_MMIO_BRIDGE_CAP_GPA_LO  0x00  /* Offset from cap base */
+   #define PCI_MMIO_BRIDGE_CAP_GPA_HI  0x04
+   #define PCI_MMIO_BRIDGE_CAP_SIZE    0x08
+   #define PCI_MMIO_BRIDGE_CAP_DEPTH   0x0C
+
+   /* Read shadow buffer GPA */
+   uint32_t gpa_lo = pci_read_config_dword(pdev, 
+                                          PCI_MMIO_BRIDGE_CAP_OFFSET + 0);
+   uint32_t gpa_hi = pci_read_config_dword(pdev, 
+                                          PCI_MMIO_BRIDGE_CAP_OFFSET + 4);
+   uint64_t shadow_gpa = ((uint64_t)gpa_hi << 32) | gpa_lo;
+
+   /* Read buffer size and queue depth */
+   uint32_t shadow_size = pci_read_config_dword(pdev, 
+                                                PCI_MMIO_BRIDGE_CAP_OFFSET + 8);
+   uint32_t queue_depth = pci_read_config_dword(pdev, 
+                                                PCI_MMIO_BRIDGE_CAP_OFFSET + 12);
 
 QEMU Configuration
 ------------------
@@ -70,33 +100,37 @@ Add the device to your VM:
 
    qemu-system-x86_64 \
        -machine q35 \
+       -m 4G \
        -device pci-mmio-bridge,id=mmio-bridge
 
-This creates a bridge with default settings:
+This creates a bridge with defaults:
 
-- BAR0 size: 4096 bytes (169 command slots)
+- Shadow GPA: 0x80000000 (auto-selected if 0)
+- Shadow size: 4096 bytes (169 command slots)
 - Polling interval: 1ms
 - Enabled by default
 
 Custom Configuration
 ~~~~~~~~~~~~~~~~~~~~
 
-Adjust BAR size and polling:
+Specify shadow buffer location and size:
 
 .. code-block:: bash
 
    qemu-system-x86_64 \
        -machine q35 \
        -device pci-mmio-bridge,id=mmio-bridge,\
-               bar-size=8192,\
+               shadow-gpa=0x90000000,\
+               shadow-size=8192,\
                poll-interval-ns=500000
 
-Parameters:
+Properties:
 
-- ``bar-size``: Shadow buffer size (4096-65536 bytes, must be power of 2)
+- ``shadow-gpa``: Guest physical address for buffer (0 = auto, default: 0x80000000)
+- ``shadow-size``: Buffer size in bytes (default: 4096, min: 4096)
 - ``poll-interval-ns``: Polling interval in nanoseconds (default: 1000000)
 - ``enabled``: Enable/disable bridge (default: true)
-- ``addr``: PCI address (e.g., ``addr=5.0`` for slot 5)
+- ``addr``: PCI slot address (e.g., ``addr=5.0`` for slot 5)
 
 Multiple Bridges
 ~~~~~~~~~~~~~~~~
@@ -107,10 +141,10 @@ Create multiple independent bridges:
 
    qemu-system-x86_64 \
        -machine q35 \
-       -device pci-mmio-bridge,id=mmio-bridge-0,addr=4.0 \
-       -device pci-mmio-bridge,id=mmio-bridge-1,addr=5.0
+       -device pci-mmio-bridge,id=bridge0,shadow-gpa=0x80000000,addr=4.0 \
+       -device pci-mmio-bridge,id=bridge1,shadow-gpa=0x81000000,addr=5.0
 
-Each bridge has its own command queue and operates independently.
+Each bridge has its own shadow buffer at different GPAs.
 
 Guest Driver Usage
 ------------------
@@ -118,54 +152,74 @@ Guest Driver Usage
 Linux Kernel Driver
 ~~~~~~~~~~~~~~~~~~~
 
-Example PCI driver for the bridge:
+Example PCI driver that discovers and uses the bridge:
 
 .. code-block:: c
 
    #include <linux/pci.h>
    #include <linux/module.h>
+   #include <linux/io.h>
    
    #define PCI_VENDOR_ID_REDHAT_QEMU  0x1b36
    #define PCI_DEVICE_ID_MMIO_BRIDGE  0x0010
    
-   static const struct pci_device_id mmio_bridge_pci_tbl[] = {
-       { PCI_DEVICE(PCI_VENDOR_ID_REDHAT_QEMU,
-                    PCI_DEVICE_ID_MMIO_BRIDGE) },
-       { 0, }
+   /* Config space offsets */
+   #define CAP_OFFSET  0x40
+   #define CAP_GPA_LO  0x00
+   #define CAP_GPA_HI  0x04
+   #define CAP_SIZE    0x08
+   #define CAP_DEPTH   0x0C
+   
+   struct mmio_bridge_dev {
+       struct pci_dev *pdev;
+       void __iomem *shadow_buf;
+       uint64_t shadow_gpa;
+       uint32_t shadow_size;
+       uint32_t queue_depth;
    };
-   MODULE_DEVICE_TABLE(pci, mmio_bridge_pci_tbl);
    
    static int mmio_bridge_probe(struct pci_dev *pdev,
                                 const struct pci_device_id *id)
    {
-       void __iomem *bar0;
-       struct pci_mmio_ring_meta *meta;
+       struct mmio_bridge_dev *dev;
+       uint32_t gpa_lo, gpa_hi;
        int err;
+       
+       dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+       if (!dev)
+           return -ENOMEM;
+       
+       dev->pdev = pdev;
        
        err = pci_enable_device(pdev);
        if (err)
            return err;
        
-       err = pci_request_regions(pdev, "pci-mmio-bridge");
-       if (err)
-           goto err_disable;
+       /* Read shadow buffer location from config space */
+       pci_read_config_dword(pdev, CAP_OFFSET + CAP_GPA_LO, &gpa_lo);
+       pci_read_config_dword(pdev, CAP_OFFSET + CAP_GPA_HI, &gpa_hi);
+       pci_read_config_dword(pdev, CAP_OFFSET + CAP_SIZE, &dev->shadow_size);
+       pci_read_config_dword(pdev, CAP_OFFSET + CAP_DEPTH, &dev->queue_depth);
        
-       bar0 = pci_iomap(pdev, 0, 0);
-       if (!bar0) {
+       dev->shadow_gpa = ((uint64_t)gpa_hi << 32) | gpa_lo;
+       
+       pr_info("PCI MMIO Bridge: GPA=0x%llx size=%u depth=%u\n",
+               dev->shadow_gpa, dev->shadow_size, dev->queue_depth);
+       
+       /* Map shadow buffer (guest RAM, not MMIO) */
+       dev->shadow_buf = ioremap(dev->shadow_gpa, dev->shadow_size);
+       if (!dev->shadow_buf) {
            err = -ENOMEM;
-           goto err_release;
+           goto err_disable;
        }
        
-       meta = (struct pci_mmio_ring_meta *)bar0;
-       pr_info("PCI MMIO Bridge: queue_depth=%u\n",
-               ioread32(&meta->queue_depth));
+       pci_set_drvdata(pdev, dev);
        
-       /* Store for later use */
-       pci_set_drvdata(pdev, bar0);
+       /* Shadow buffer is now accessible at dev->shadow_buf */
+       /* Can be used for command queue operations */
+       
        return 0;
        
-   err_release:
-       pci_release_regions(pdev);
    err_disable:
        pci_disable_device(pdev);
        return err;
@@ -173,16 +227,24 @@ Example PCI driver for the bridge:
    
    static void mmio_bridge_remove(struct pci_dev *pdev)
    {
-       void __iomem *bar0 = pci_get_drvdata(pdev);
+       struct mmio_bridge_dev *dev = pci_get_drvdata(pdev);
        
-       pci_iounmap(pdev, bar0);
-       pci_release_regions(pdev);
+       if (dev->shadow_buf)
+           iounmap(dev->shadow_buf);
+       
        pci_disable_device(pdev);
    }
    
+   static const struct pci_device_id mmio_bridge_ids[] = {
+       { PCI_DEVICE(PCI_VENDOR_ID_REDHAT_QEMU, 
+                    PCI_DEVICE_ID_MMIO_BRIDGE) },
+       { 0, }
+   };
+   MODULE_DEVICE_TABLE(pci, mmio_bridge_ids);
+   
    static struct pci_driver mmio_bridge_driver = {
        .name       = "pci-mmio-bridge",
-       .id_table   = mmio_bridge_pci_tbl,
+       .id_table   = mmio_bridge_ids,
        .probe      = mmio_bridge_probe,
        .remove     = mmio_bridge_remove,
    };
@@ -190,93 +252,128 @@ Example PCI driver for the bridge:
    module_pci_driver(mmio_bridge_driver);
    MODULE_LICENSE("GPL");
 
-Userspace Access (Linux)
-~~~~~~~~~~~~~~~~~~~~~~~~~
+VFIO Device Access
+~~~~~~~~~~~~~~~~~~
 
-Access via sysfs (requires root):
+For VFIO devices to DMA to the shadow buffer:
 
 .. code-block:: c
 
-   #include <stdio.h>
-   #include <fcntl.h>
-   #include <sys/mman.h>
-   #include <stdint.h>
+   /* In VFIO setup code */
    
-   int main() {
-       int fd;
-       void *bar0;
-       struct pci_mmio_ring_meta {
-           uint32_t producer_idx;
-           uint32_t consumer_idx;
-           uint32_t queue_depth;
-           uint32_t reserved;
-       } *meta;
-       
-       fd = open("/sys/bus/pci/devices/0000:00:04.0/resource0",
-                 O_RDWR | O_SYNC);
-       if (fd < 0) {
-           perror("open");
-           return 1;
-       }
-       
-       bar0 = mmap(NULL, 4096, PROT_READ|PROT_WRITE,
-                   MAP_SHARED, fd, 0);
-       if (bar0 == MAP_FAILED) {
-           perror("mmap");
-           return 1;
-       }
-       
-       meta = (struct pci_mmio_ring_meta *)bar0;
-       
-       printf("Queue depth: %u\n", meta->queue_depth);
-       printf("Producer: %u\n", meta->producer_idx);
-       printf("Consumer: %u\n", meta->consumer_idx);
-       
-       munmap(bar0, 4096);
-       close(fd);
-       return 0;
-   }
-
-Compile and run:
-
-.. code-block:: bash
-
-   gcc -o check-bridge check-bridge.c
-   sudo ./check-bridge
+   /* Read shadow GPA from PCI config space (as above) */
+   uint64_t shadow_gpa = ...;
+   uint32_t shadow_size = ...;
+   
+   /* Map shadow buffer into VFIO container */
+   /* IOVA = GPA (1:1 mapping in guest) */
+   struct vfio_iommu_type1_dma_map map = {
+       .argsz = sizeof(map),
+       .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+       .vaddr = (uint64_t)shadow_buf_hva,  /* Host virtual address */
+       .iova = shadow_gpa,                 /* IOVA = GPA */
+       .size = shadow_size,
+   };
+   
+   ioctl(container_fd, VFIO_IOMMU_MAP_DMA, &map);
+   
+   /* Now VFIO device can DMA to shadow_gpa (as IOVA) */
+   /* Program device to write commands to shadow_gpa */
 
 Command Packet Format
 ---------------------
 
-Commands are written to BAR0 using the same format as the machine-integrated
-version. See ``pci-mmio-bridge.rst`` for detailed packet structure.
+See ``pci-mmio-bridge.rst`` for the complete command packet structure.
+The format is identical for both PCI device and machine-integrated versions.
 
-Quick reference:
-
-.. code-block:: c
-
-   struct pci_mmio_command {
-       uint16_t target_bdf;      // Bus:Device:Function
-       uint8_t  target_bar;      // Which BAR (0-5)
-       uint8_t  reserved1;
-       uint32_t offset;          // Offset within BAR
-       uint64_t value;           // Value to write/read
-       uint8_t  command;         // 1=WRITE, 2=READ
-       uint8_t  size;            // 1, 2, 4, or 8 bytes
-       uint8_t  status;          // 0=PENDING, 1=COMPLETE, 2=ERROR
-       uint8_t  reserved2;
-       uint32_t sequence;        // Command sequence number
-   } __attribute__((packed));
-
-Ring buffer metadata (first 16 bytes of BAR0):
+Quick reference - Ring metadata at offset 0:
 
 .. code-block:: c
 
    struct pci_mmio_ring_meta {
-       uint32_t producer_idx;    // Guest writes here
-       uint32_t consumer_idx;    // QEMU reads from here
-       uint32_t queue_depth;     // Max commands
+       uint32_t producer_idx;    // Guest/device writes here
+       uint32_t consumer_idx;    // QEMU updates this
+       uint32_t queue_depth;     // Max commands (read-only)
        uint32_t reserved;
-   } __attribute__((packed));
+   };
+
+Commands start at offset 24 (sizeof ring_meta).
+
+Architecture Details
+--------------------
+
+Why Not Use a BAR?
+~~~~~~~~~~~~~~~~~~
+
+**Problem**: Traditional PCI devices expose functionality via BARs (Base
+Address Registers) in MMIO space. However:
+
+1. VFIO's Type-1 IOMMU can only map **guest RAM**, not MMIO space
+2. Real VFIO devices cannot DMA to PCI MMIO addresses
+3. The shadow buffer MUST be guest RAM for VFIO DMA access
+
+**Solution**: Hybrid approach:
+
+- PCI device for discovery (standard enumeration)
+- Shadow buffer in guest RAM (VFIO-compatible)
+- GPA exposed via config space (guest drivers read location)
+
+Memory Layout
+~~~~~~~~~~~~~
+
+::
+
+   Guest Physical Memory:
+   +---------------------------+
+   | 0x00000000 - 0x7FFFFFFF   |  Regular RAM
+   +---------------------------+
+   | 0x80000000 - 0x80000FFF   |  Shadow Buffer (default, 4KB)
+   |   - Ring metadata (24B)   |
+   |   - Command slots (169x)  |
+   +---------------------------+
+   | 0x80001000 - ...          |  More RAM or devices
+   +---------------------------+
+
+The shadow buffer location is configurable via ``shadow-gpa`` property.
+
+IOVA Mapping
+~~~~~~~~~~~~
+
+For guest perspective:
+
+- **GPA** (Guest Physical Address): Where guest OS sees the buffer
+- **IOVA** (I/O Virtual Address): Where devices use for DMA
+- **Mapping**: IOVA = GPA (1:1 mapping in Type-1 IOMMU)
+
+For host perspective:
+
+- **HVA** (Host Virtual Address): QEMU's pointer to shadow buffer
+- **GPA**: Guest's view of same memory
+- QEMU allocates guest RAM and provides HVA for internal access
+
+Use Cases
+---------
+
+GPU Direct Storage
+~~~~~~~~~~~~~~~~~~
+
+GPU writes NVMe doorbells without CPU:
+
+1. GPU driver maps shadow buffer (ioremap GPA from config space)
+2. GPU DMA engine configured with shadow_gpa as IOVA
+3. GPU writes WRITE command to shadow buffer
+4. QEMU processes command, updates NVMe doorbell
+5. NVMe processes I/O
+
+Multi-Device Coordination
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+FPGA → GPU synchronization:
+
+1. Both devices map shadow buffer via VFIO IOMMU
+2. FPGA completes work, writes READ command to get GPU status
+3. GPU updates shared register via WRITE command
+4. All via DMA, no CPU involvement
 
 Comparison with Machine Integration
 ------------------------------------
@@ -284,11 +381,11 @@ Comparison with Machine Integration
 +-------------------------+----------------------+------------------------+
 | Feature                 | PCI Device           | Machine Integration    |
 +=========================+======================+========================+
-| Discovery               | Automatic (lspci)    | Manual (/dev/mem)      |
+| Discovery               | Automatic (lspci)    | Manual (fixed GPA)     |
 +-------------------------+----------------------+------------------------+
-| GPA Assignment          | PCI enumeration      | Fixed or configurable  |
+| GPA Assignment          | Configurable         | Fixed or configurable  |
 +-------------------------+----------------------+------------------------+
-| Multiple Instances      | Easy (-device x N)   | Complex                |
+| Multiple Instances      | Easy                 | Complex                |
 +-------------------------+----------------------+------------------------+
 | Guest Driver            | Standard PCI driver  | Platform driver        |
 +-------------------------+----------------------+------------------------+
@@ -296,93 +393,85 @@ Comparison with Machine Integration
 +-------------------------+----------------------+------------------------+
 | Hotplug Support         | Yes                  | No                     |
 +-------------------------+----------------------+------------------------+
+| VFIO DMA                | ✅ Yes (guest RAM)   | ✅ Yes (guest RAM)     |
++-------------------------+----------------------+------------------------+
+| Shadow Buffer Type      | Guest RAM            | Guest RAM              |
++-------------------------+----------------------+------------------------+
 
-**Recommendation**: Use the PCI device version for new deployments. It's more
-standard, more flexible, and easier for guests to discover.
+Both versions use guest RAM for VFIO compatibility. The PCI device version
+adds automatic discovery.
 
 Performance Considerations
 --------------------------
 
-BAR Size
-~~~~~~~~
+Shadow Buffer Size
+~~~~~~~~~~~~~~~~~~
 
-- **4KB** (169 commands): Good for light usage, minimal memory overhead
+- **4KB** (169 commands): Minimal overhead, good for light usage
 - **8KB** (340 commands): Better for moderate workloads
-- **16KB** (682 commands): High-throughput scenarios
-- **32KB+**: Very high throughput, may increase latency
+- **16KB+**: High throughput, may increase latency
 
 Polling Interval
 ~~~~~~~~~~~~~~~~
 
-- **1ms** (default): Good balance for most workloads
+- **1ms** (default): Good balance
 - **100μs**: Lower latency, higher CPU usage
-- **10ms**: Lower CPU usage, higher latency
+- **10ms**: Lower CPU, higher latency
 
-Rule of thumb: ``poll_interval_ns`` should be ~10x your expected command rate.
-
-Debugging
----------
-
-Enable Tracing
-~~~~~~~~~~~~~~
-
-.. code-block:: bash
-
-   qemu-system-x86_64 \
-       ... \
-       -trace 'pci_mmio_bridge_pci_*' \
-       -trace 'pci_mmio_bridge_write' \
-       -trace 'pci_mmio_bridge_read'
-
-Monitor Commands
-~~~~~~~~~~~~~~~~
-
-Query device info:
-
-.. code-block:: text
-
-   (qemu) info pci
-   Bus  0, device   4, function 0:
-     System peripheral: PCI device 1b36:0010
-       BAR0: 32 bit memory at 0xfea00000 [0xfea00fff].
-       id "mmio-bridge"
-
-Common Issues
--------------
+Troubleshooting
+---------------
 
 Device Not Found
 ~~~~~~~~~~~~~~~~
 
-If ``lspci`` doesn't show the device:
+.. code-block:: bash
 
-1. Check QEMU command line includes ``-device pci-mmio-bridge``
-2. Verify PCI enumeration completed (watch ``dmesg`` during boot)
-3. Try explicit PCI address: ``-device pci-mmio-bridge,addr=4.0``
+   lspci | grep 1b36
+   # Should show: System peripheral: Red Hat, Inc. Device 0010
 
-BAR Not Mapped
-~~~~~~~~~~~~~~
+If missing:
 
-If BAR0 shows as disabled:
+1. Check QEMU has ``-device pci-mmio-bridge``
+2. Verify PCI enumeration completed (check dmesg)
 
-1. Ensure PCI device is enabled (``setpci -s 00:04.0 COMMAND``should include bit 1)
-2. Check if guest OS assigned an address to the BAR
-3. Try booting without ``-S`` (start paused) flag
+Cannot Access Shadow Buffer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If shadow buffer is not accessible:
+
+1. **Read config space**: Verify GPA is non-zero
+2. **Check permissions**: ioremap may require root/CAP_SYS_RAWIO
+3. **Verify GPA**: Must be valid guest physical address
+
+VFIO DMA Mapping Fails
+~~~~~~~~~~~~~~~~~~~~~~~
+
+If ``vfio_container_dma_map()`` returns EINVAL:
+
+1. **Verify GPA**: Must be guest RAM, not MMIO
+2. **Check alignment**: GPA should be page-aligned
+3. **Size**: Must be page-aligned size
+4. **Permissions**: Ensure VFIO container has correct permissions
 
 Commands Not Processing
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-If commands stay in PENDING status:
+Enable tracing:
 
-1. Check ``enabled`` property is true
-2. Verify producer index is being updated
-3. Enable trace events to see if polling is happening
-4. Check that target device BDF is correct
+.. code-block:: bash
+
+   -trace pci_mmio_bridge_pci_*
+   -trace pci_mmio_bridge_*
+
+Check:
+
+1. Producer index is being updated
+2. Queue not full (producer != consumer + queue_depth)
+3. Commands have valid BDF/BAR/offset
 
 See Also
 --------
 
-- ``pci-mmio-bridge.rst`` - Generic bridge architecture and command format
+- ``pci-mmio-bridge.rst`` - Core bridge architecture and command format
 - ``pci-mmio-bridge-quickstart.txt`` - Quick start guide
-- ``GUEST_VISIBILITY.md`` - Guest discovery mechanisms
-- ``P2P_PROXY_GUEST_ARCHITECTURE.md`` - Architecture details
-
+- ``P2P_PROXY_GUEST_ARCHITECTURE.md`` - Detailed implementation notes

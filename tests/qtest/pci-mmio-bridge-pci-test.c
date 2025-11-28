@@ -19,6 +19,37 @@
 #define PCI_VENDOR_ID_REDHAT_QEMU  0x1b36
 #define PCI_DEVICE_ID_MMIO_BRIDGE  0x0010
 
+/* Vendor-specific config space offsets */
+#define PCI_MMIO_BRIDGE_CAP_OFFSET  0x40
+#define PCI_MMIO_BRIDGE_CAP_GPA_LO  0x00
+#define PCI_MMIO_BRIDGE_CAP_GPA_HI  0x04
+#define PCI_MMIO_BRIDGE_CAP_SIZE    0x08
+#define PCI_MMIO_BRIDGE_CAP_DEPTH   0x0C
+
+/* Helper: Read shadow buffer GPA from PCI config space */
+static uint64_t read_shadow_gpa(QPCIDevice *dev)
+{
+    uint32_t gpa_lo = qpci_config_readl(dev, PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                                        PCI_MMIO_BRIDGE_CAP_GPA_LO);
+    uint32_t gpa_hi = qpci_config_readl(dev, PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                                        PCI_MMIO_BRIDGE_CAP_GPA_HI);
+    return ((uint64_t)gpa_hi << 32) | gpa_lo;
+}
+
+/* Helper: Read shadow buffer size from PCI config space */
+static uint32_t read_shadow_size(QPCIDevice *dev)
+{
+    return qpci_config_readl(dev, PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                            PCI_MMIO_BRIDGE_CAP_SIZE);
+}
+
+/* Helper: Read queue depth from PCI config space */
+static uint32_t read_queue_depth(QPCIDevice *dev)
+{
+    return qpci_config_readl(dev, PCI_MMIO_BRIDGE_CAP_OFFSET + 
+                            PCI_MMIO_BRIDGE_CAP_DEPTH);
+}
+
 /* Helper: Find bridge device on PCI bus */
 static QPCIDevice *find_pci_mmio_bridge(QPCIBus *bus)
 {
@@ -118,38 +149,42 @@ static void test_pci_device_discovery(void)
     qtest_quit(qts);
 }
 
-/* Test: BAR0 is present and accessible */
-static void test_pci_bar0_access(void)
+/* Test: Shadow buffer GPA is exposed via config space */
+static void test_pci_shadow_gpa_access(void)
 {
     QTestState *qts;
     QPCIBus *pcibus;
     QPCIDevice *dev;
-    QPCIBar bar0;
+    uint64_t shadow_gpa;
+    uint32_t shadow_size, queue_depth;
     struct pci_mmio_ring_meta meta;
 
     qts = qtest_init("-machine q35 "
-                     "-device pci-mmio-bridge,id=bridge0,bar-size=4096");
+                     "-device pci-mmio-bridge,id=bridge0,shadow-size=4096");
 
     pcibus = qpci_new_pc(qts, NULL);
-    dev = qpci_device_find(pcibus, QPCI_DEVFN(0, 0));
+    dev = find_pci_mmio_bridge(pcibus);
     g_assert_nonnull(dev);
 
     /* Enable device */
     qpci_device_enable(dev);
 
-    /* Get BAR0 */
-    bar0 = qpci_iomap(dev, 0, NULL);
-    g_assert_cmpuint(bar0.addr, !=, 0);
+    /* Read shadow buffer location from PCI config space */
+    shadow_gpa = read_shadow_gpa(dev);
+    shadow_size = read_shadow_size(dev);
+    queue_depth = read_queue_depth(dev);
 
-    /* Read ring metadata from BAR0 */
-    qpci_memread(dev, bar0, 0, &meta, sizeof(meta));
+    /* Verify config space values */
+    g_assert_cmpuint(shadow_gpa, >, 0);
+    g_assert_cmpuint(shadow_size, ==, 4096);
+    g_assert_cmpuint(queue_depth, ==, 169);  /* (4096/24)-1 */
+
+    /* Read ring metadata from guest RAM at shadow_gpa */
+    qtest_memread(qts, shadow_gpa, &meta, sizeof(meta));
 
     /* Verify metadata is initialized */
     g_assert_cmpuint(meta.producer_idx, ==, 0);
     g_assert_cmpuint(meta.consumer_idx, ==, 0);
-    g_assert_cmpuint(meta.queue_depth, >, 0);
-    
-    /* Expected queue depth for 4096 bytes: (4096/24)-1 = 169 */
     g_assert_cmpuint(meta.queue_depth, ==, 169);
 
     g_free(dev);
@@ -157,36 +192,36 @@ static void test_pci_bar0_access(void)
     qtest_quit(qts);
 }
 
-/* Test: BAR size property */
-static void test_pci_bar_size_property(void)
+/* Test: Shadow size property */
+static void test_pci_shadow_size_property(void)
 {
     QTestState *qts;
     QPCIBus *pcibus;
     QPCIDevice *dev;
-    QPCIBar bar0;
-    uint32_t bar_size;
+    uint64_t shadow_gpa;
+    uint32_t shadow_size, queue_depth;
     struct pci_mmio_ring_meta meta;
 
     qts = qtest_init("-machine q35 "
-                     "-device pci-mmio-bridge,bar-size=8192");
+                     "-device pci-mmio-bridge,shadow-size=8192");
 
     pcibus = qpci_new_pc(qts, NULL);
-    dev = qpci_device_find(pcibus, QPCI_DEVFN(0, 0));
+    dev = find_pci_mmio_bridge(pcibus);
     g_assert_nonnull(dev);
 
     qpci_device_enable(dev);
-    bar0 = qpci_iomap(dev, 0, NULL);
 
-    /* Read BAR size from config space */
-    bar_size = qpci_config_readl(dev, PCI_BASE_ADDRESS_0);
-    qpci_config_writel(dev, PCI_BASE_ADDRESS_0, 0xFFFFFFFF);
-    bar_size = qpci_config_readl(dev, PCI_BASE_ADDRESS_0);
-    bar_size = ~(bar_size & ~0xF) + 1;
+    /* Read shadow buffer info from config space */
+    shadow_gpa = read_shadow_gpa(dev);
+    shadow_size = read_shadow_size(dev);
+    queue_depth = read_queue_depth(dev);
     
-    g_assert_cmpuint(bar_size, ==, 8192);
+    /* Verify size is 8192 and queue depth matches: (8192/24)-1 = 340 */
+    g_assert_cmpuint(shadow_size, ==, 8192);
+    g_assert_cmpuint(queue_depth, ==, 340);
 
-    /* Verify queue depth matches 8192 bytes: (8192/24)-1 = 340 */
-    qpci_memread(dev, bar0, 0, &meta, sizeof(meta));
+    /* Verify metadata in guest RAM */
+    qtest_memread(qts, shadow_gpa, &meta, sizeof(meta));
     g_assert_cmpuint(meta.queue_depth, ==, 340);
 
     g_free(dev);
@@ -194,13 +229,14 @@ static void test_pci_bar_size_property(void)
     qtest_quit(qts);
 }
 
-/* Test: Basic write command via BAR0 */
+/* Test: Basic write command via shadow buffer */
 static void test_pci_write_command(void)
 {
     QTestState *qts;
     QPCIBus *pcibus;
     QPCIDevice *bridge_dev, *test_dev;
-    QPCIBar bridge_bar, test_bar;
+    QPCIBar test_bar;
+    uint64_t shadow_gpa;
     struct pci_mmio_command cmd = {0};
     struct pci_mmio_ring_meta meta;
     uint32_t test_value_read;
@@ -211,11 +247,11 @@ static void test_pci_write_command(void)
 
     pcibus = qpci_new_pc(qts, NULL);
     
-    /* Get bridge device */
+    /* Get bridge device and shadow GPA */
     bridge_dev = find_pci_mmio_bridge(pcibus);
     g_assert_nonnull(bridge_dev);
     qpci_device_enable(bridge_dev);
-    bridge_bar = qpci_iomap(bridge_dev, 0, NULL);
+    shadow_gpa = read_shadow_gpa(bridge_dev);
 
     /* Get test device */
     test_dev = find_pci_testdev(pcibus);
@@ -239,18 +275,18 @@ static void test_pci_write_command(void)
     cmd.status = PCI_MMIO_STATUS_PENDING;
     cmd.sequence = 1;
 
-    /* Write command to slot 1 (slot 0 is metadata) */
-    qpci_memwrite(bridge_dev, bridge_bar, sizeof(meta), &cmd, sizeof(cmd));
+    /* Write command to slot 1 in guest RAM (slot 0 is metadata) */
+    qtest_memwrite(qts, shadow_gpa + sizeof(meta), &cmd, sizeof(cmd));
 
     /* Update producer index to signal command */
     meta.producer_idx = 1;
-    qpci_memwrite(bridge_dev, bridge_bar, 0, &meta.producer_idx, 4);
+    qtest_memwrite(qts, shadow_gpa, &meta.producer_idx, 4);
 
     /* Give QEMU time to process (BH should trigger) */
     qtest_clock_step(qts, 10000000); /* 10ms */
 
     /* Read back command to check status */
-    qpci_memread(bridge_dev, bridge_bar, sizeof(meta), &cmd, sizeof(cmd));
+    qtest_memread(qts, shadow_gpa + sizeof(meta), &cmd, sizeof(cmd));
     g_assert_cmpuint(cmd.status, ==, PCI_MMIO_STATUS_COMPLETE);
 
     /* Verify write reached target device */
@@ -263,13 +299,14 @@ static void test_pci_write_command(void)
     qtest_quit(qts);
 }
 
-/* Test: Basic read command via BAR0 */
+/* Test: Basic read command via shadow buffer */
 static void test_pci_read_command(void)
 {
     QTestState *qts;
     QPCIBus *pcibus;
     QPCIDevice *bridge_dev, *test_dev;
-    QPCIBar bridge_bar, test_bar;
+    QPCIBar test_bar;
+    uint64_t shadow_gpa;
     struct pci_mmio_command cmd = {0};
     struct pci_mmio_ring_meta meta;
     uint32_t expected_value = 0xCAFEBABE;
@@ -280,10 +317,10 @@ static void test_pci_read_command(void)
 
     pcibus = qpci_new_pc(qts, NULL);
     
-    bridge_dev = qpci_device_find(pcibus, QPCI_DEVFN(0, 0));
+    bridge_dev = find_pci_mmio_bridge(pcibus);
     g_assert_nonnull(bridge_dev);
     qpci_device_enable(bridge_dev);
-    bridge_bar = qpci_iomap(bridge_dev, 0, NULL);
+    shadow_gpa = read_shadow_gpa(bridge_dev);
 
     test_dev = find_pci_testdev(pcibus);
     if (!test_dev) {
@@ -309,18 +346,18 @@ static void test_pci_read_command(void)
     cmd.status = PCI_MMIO_STATUS_PENDING;
     cmd.sequence = 1;
 
-    /* Write command to slot 1 */
-    qpci_memwrite(bridge_dev, bridge_bar, sizeof(meta), &cmd, sizeof(cmd));
+    /* Write command to slot 1 in guest RAM */
+    qtest_memwrite(qts, shadow_gpa + sizeof(meta), &cmd, sizeof(cmd));
 
     /* Signal command */
     meta.producer_idx = 1;
-    qpci_memwrite(bridge_dev, bridge_bar, 0, &meta.producer_idx, 4);
+    qtest_memwrite(qts, shadow_gpa, &meta.producer_idx, 4);
 
     /* Wait for processing */
     qtest_clock_step(qts, 10000000);
 
     /* Read back command */
-    qpci_memread(bridge_dev, bridge_bar, sizeof(meta), &cmd, sizeof(cmd));
+    qtest_memread(qts, shadow_gpa + sizeof(meta), &cmd, sizeof(cmd));
     g_assert_cmpuint(cmd.status, ==, PCI_MMIO_STATUS_COMPLETE);
     g_assert_cmpuint(cmd.value, ==, expected_value);
 
@@ -336,22 +373,22 @@ static void test_pci_device_reset(void)
     QTestState *qts;
     QPCIBus *pcibus;
     QPCIDevice *dev;
-    QPCIBar bar0;
+    uint64_t shadow_gpa;
     struct pci_mmio_ring_meta meta;
 
     qts = qtest_init("-machine q35 "
                      "-device pci-mmio-bridge,id=bridge0");
 
     pcibus = qpci_new_pc(qts, NULL);
-    dev = qpci_device_find(pcibus, QPCI_DEVFN(0, 0));
+    dev = find_pci_mmio_bridge(pcibus);
     g_assert_nonnull(dev);
 
     qpci_device_enable(dev);
-    bar0 = qpci_iomap(dev, 0, NULL);
+    shadow_gpa = read_shadow_gpa(dev);
 
     /* Write some data to producer index */
     meta.producer_idx = 5;
-    qpci_memwrite(dev, bar0, 0, &meta.producer_idx, 4);
+    qtest_memwrite(qts, shadow_gpa, &meta.producer_idx, 4);
 
     /* Reset device */
     qtest_qmp_send(qts, "{ 'execute': 'system_reset' }");
@@ -359,7 +396,7 @@ static void test_pci_device_reset(void)
     qtest_clock_step(qts, 1000000);
 
     /* Verify producer index reset to 0 */
-    qpci_memread(dev, bar0, 0, &meta, sizeof(meta));
+    qtest_memread(qts, shadow_gpa, &meta, sizeof(meta));
     g_assert_cmpuint(meta.producer_idx, ==, 0);
     g_assert_cmpuint(meta.consumer_idx, ==, 0);
 
@@ -406,10 +443,10 @@ int main(int argc, char **argv)
 
     qtest_add_func("/pci-mmio-bridge-pci/device-discovery",
                    test_pci_device_discovery);
-    qtest_add_func("/pci-mmio-bridge-pci/bar0-access",
-                   test_pci_bar0_access);
-    qtest_add_func("/pci-mmio-bridge-pci/bar-size-property",
-                   test_pci_bar_size_property);
+    qtest_add_func("/pci-mmio-bridge-pci/shadow-gpa-access",
+                   test_pci_shadow_gpa_access);
+    qtest_add_func("/pci-mmio-bridge-pci/shadow-size-property",
+                   test_pci_shadow_size_property);
     qtest_add_func("/pci-mmio-bridge-pci/write-command",
                    test_pci_write_command);
     qtest_add_func("/pci-mmio-bridge-pci/read-command",
