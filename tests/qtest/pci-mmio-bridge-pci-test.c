@@ -12,12 +12,11 @@
 #include "libqos/pci.h"
 #include "libqos/pci-pc.h"
 #include "qemu/module.h"
+#include "hw/pci/pci.h"       /* For PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE */
 #include "hw/pci/pci_ids.h"
 #include "hw/pci/pci_regs.h"
 
-/* PCI IDs for the bridge device */
-#define PCI_VENDOR_ID_REDHAT_QEMU  0x1b36
-#define PCI_DEVICE_ID_MMIO_BRIDGE  0x0010
+/* PCI IDs are defined in hw/pci/pci.h - use those central definitions */
 
 /* Vendor-specific config space offsets */
 #define PCI_MMIO_BRIDGE_CAP_OFFSET  0x40
@@ -58,8 +57,8 @@ static QPCIDevice *find_pci_mmio_bridge(QPCIBus *bus)
         if (dev) {
             uint16_t vid = qpci_config_readw(dev, PCI_VENDOR_ID);
             uint16_t did = qpci_config_readw(dev, PCI_DEVICE_ID);
-            if (vid == PCI_VENDOR_ID_REDHAT_QEMU && 
-                did == PCI_DEVICE_ID_MMIO_BRIDGE) {
+            if (vid == PCI_VENDOR_ID_REDHAT && 
+                did == PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE) {
                 return dev;
             }
             g_free(dev);
@@ -140,8 +139,8 @@ static void test_pci_device_discovery(void)
     device_id = qpci_config_readw(dev, PCI_DEVICE_ID);
     class_id = qpci_config_readb(dev, PCI_CLASS_DEVICE);
 
-    g_assert_cmpuint(vendor_id, ==, PCI_VENDOR_ID_REDHAT_QEMU);
-    g_assert_cmpuint(device_id, ==, PCI_DEVICE_ID_MMIO_BRIDGE);
+    g_assert_cmpuint(vendor_id, ==, PCI_VENDOR_ID_REDHAT);
+    g_assert_cmpuint(device_id, ==, PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE);
     g_assert_cmpuint(class_id, ==, 0x80); /* PCI_CLASS_SYSTEM_OTHER */
 
     g_free(dev);
@@ -423,13 +422,13 @@ static void test_pci_multiple_bridges(void)
     dev1 = qpci_device_find(pcibus, QPCI_DEVFN(4, 0));
     g_assert_nonnull(dev1);
     device_id = qpci_config_readw(dev1, PCI_DEVICE_ID);
-    g_assert_cmpuint(device_id, ==, PCI_DEVICE_ID_MMIO_BRIDGE);
+    g_assert_cmpuint(device_id, ==, PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE);
 
     /* Find second bridge */
     dev2 = qpci_device_find(pcibus, QPCI_DEVFN(5, 0));
     g_assert_nonnull(dev2);
     device_id = qpci_config_readw(dev2, PCI_DEVICE_ID);
-    g_assert_cmpuint(device_id, ==, PCI_DEVICE_ID_MMIO_BRIDGE);
+    g_assert_cmpuint(device_id, ==, PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE);
 
     g_free(dev1);
     g_free(dev2);

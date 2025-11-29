@@ -27,40 +27,7 @@
 /* Default polling interval: 1ms */
 #define DEFAULT_POLL_INTERVAL_NS (1000 * 1000)
 
-/* Memory write callback - triggers immediate poll when producer index changes */
-static void pci_mmio_bridge_shadow_write(void *opaque, hwaddr addr,
-                                         uint64_t value, unsigned size)
-{
-    PCIMMIOBridgeState *bridge = opaque;
-    
-    /* Write through to actual RAM */
-    memcpy(bridge->shadow_hva + addr, &value, size);
-    
-    /* If writing to producer index (first 4 bytes), trigger immediate poll */
-    if (addr < 4 && bridge->enabled && bridge->poll_bh) {
-        qemu_bh_schedule(bridge->poll_bh);
-    }
-}
-
-static uint64_t pci_mmio_bridge_shadow_read(void *opaque, hwaddr addr,
-                                             unsigned size)
-{
-    PCIMMIOBridgeState *bridge = opaque;
-    uint64_t value = 0;
-    
-    memcpy(&value, bridge->shadow_hva + addr, size);
-    return value;
-}
-
-static const MemoryRegionOps pci_mmio_bridge_shadow_ops = {
-    .read = pci_mmio_bridge_shadow_read,
-    .write = pci_mmio_bridge_shadow_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
+/* Callbacks removed - using direct RAM access now */
 
 /* Helper: Extract bus number from BDF */
 static inline uint8_t bdf_to_bus(uint16_t bdf)
@@ -127,7 +94,8 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
     case PCI_MMIO_CMD_READ:
         break;
     default:
-        cmd->status = PCI_MMIO_STATUS_ERROR;
+        qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+        smp_wmb();
         trace_pci_mmio_bridge_invalid_command(cmd->command);
         return;
     }
@@ -135,14 +103,16 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
     /* Find target device */
     target = pci_mmio_bridge_find_device(bridge, cmd->target_bdf);
     if (!target) {
-        cmd->status = PCI_MMIO_STATUS_ERROR;
+        qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+        smp_wmb();  /* Ensure status is visible to guest */
         trace_pci_mmio_bridge_device_not_found(cmd->target_bdf);
         return;
     }
 
     /* Validate BAR number */
     if (cmd->target_bar >= PCI_NUM_REGIONS) {
-        cmd->status = PCI_MMIO_STATUS_ERROR;
+        qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+        smp_wmb();
         trace_pci_mmio_bridge_invalid_bar(cmd->target_bdf, cmd->target_bar);
         return;
     }
@@ -150,14 +120,16 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
     /* Get target BAR memory region */
     target_mr = target->io_regions[cmd->target_bar].memory;
     if (!target_mr || !memory_region_is_mapped(target_mr)) {
-        cmd->status = PCI_MMIO_STATUS_ERROR;
+        qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+        smp_wmb();
         trace_pci_mmio_bridge_bar_not_mapped(cmd->target_bdf, cmd->target_bar);
         return;
     }
 
     /* Validate size */
     if (cmd->size != 1 && cmd->size != 2 && cmd->size != 4 && cmd->size != 8) {
-        cmd->status = PCI_MMIO_STATUS_ERROR;
+        qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+        smp_wmb();
         trace_pci_mmio_bridge_invalid_size(cmd->size);
         return;
     }
@@ -169,12 +141,14 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
                                                cmd->value, size_memop(cmd->size),
                                                MEMTXATTRS_UNSPECIFIED);
         if (result == MEMTX_OK) {
-            cmd->status = PCI_MMIO_STATUS_COMPLETE;
+            qatomic_set(&cmd->status, PCI_MMIO_STATUS_COMPLETE);
+            smp_wmb();
             bridge->total_writes++;
             trace_pci_mmio_bridge_write(cmd->target_bdf, cmd->target_bar,
                                         cmd->offset, cmd->value, cmd->size);
         } else {
-            cmd->status = PCI_MMIO_STATUS_ERROR;
+            qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+            smp_wmb();
             bridge->total_errors++;
             trace_pci_mmio_bridge_write_failed(cmd->target_bdf, cmd->target_bar,
                                                cmd->offset, result);
@@ -188,12 +162,14 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
         if (result == MEMTX_OK) {
             cmd->value = value;
             smp_wmb();  /* Ensure value is visible before status update */
-            cmd->status = PCI_MMIO_STATUS_COMPLETE;
+            qatomic_set(&cmd->status, PCI_MMIO_STATUS_COMPLETE);
+            smp_wmb();
             bridge->total_reads++;
             trace_pci_mmio_bridge_read(cmd->target_bdf, cmd->target_bar,
                                        cmd->offset, value, cmd->size);
         } else {
-            cmd->status = PCI_MMIO_STATUS_ERROR;
+            qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
+            smp_wmb();
             bridge->total_errors++;
             trace_pci_mmio_bridge_read_failed(cmd->target_bdf, cmd->target_bar,
                                               cmd->offset, result);
@@ -214,8 +190,6 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
 void pci_mmio_bridge_poll(void *opaque)
 {
     PCIMMIOBridgeState *bridge = opaque;
-    struct pci_mmio_ring_meta *meta;
-    struct pci_mmio_command *queue;
     uint32_t producer_idx, consumer_idx;
     uint32_t commands_processed = 0;
 
@@ -225,24 +199,33 @@ void pci_mmio_bridge_poll(void *opaque)
 
     bridge->total_polls++;
 
-    /* Get ring buffer metadata from first slot */
-    meta = (struct pci_mmio_ring_meta *)bridge->shadow_hva;
-    queue = (struct pci_mmio_command *)bridge->shadow_hva;
-
-    /* Read producer index (written by guest/devices via DMA) */
-    producer_idx = qatomic_read(&meta->producer_idx);
+    /* Read metadata from guest memory using address_space_read
+     * This ensures we see GPU writes, not cached copies */
+    struct pci_mmio_ring_meta metadata;
+    address_space_read(&address_space_memory, bridge->shadow_gpa,
+                       MEMTXATTRS_UNSPECIFIED, &metadata, sizeof(metadata));
+    
+    producer_idx = metadata.producer_idx;
     consumer_idx = bridge->head;
 
     /* Process all pending commands */
     while (consumer_idx != producer_idx) {
-        uint32_t slot = (consumer_idx % bridge->queue_depth) + 1;  /* +1 to skip metadata */
-        struct pci_mmio_command *cmd = &queue[slot];
+        uint32_t slot = consumer_idx % bridge->queue_depth;
+        hwaddr cmd_addr = bridge->shadow_gpa + sizeof(struct pci_mmio_ring_meta) +
+                          (slot * sizeof(struct pci_mmio_command));
+        
+        /* Read command from guest memory to see GPU writes */
+        struct pci_mmio_command cmd;
+        address_space_read(&address_space_memory, cmd_addr,
+                           MEMTXATTRS_UNSPECIFIED, &cmd, sizeof(cmd));
 
-        /* Ensure command data is visible */
-        smp_rmb();
-
-        if (cmd->status == PCI_MMIO_STATUS_PENDING) {
-            pci_mmio_bridge_execute_command(bridge, cmd);
+        if (cmd.status == PCI_MMIO_STATUS_PENDING) {
+            pci_mmio_bridge_execute_command(bridge, &cmd);
+            
+            /* Write back status using address_space_write */
+            address_space_write(&address_space_memory, cmd_addr,
+                                MEMTXATTRS_UNSPECIFIED, &cmd, sizeof(cmd));
+            
             bridge->total_commands++;
             commands_processed++;
         }
@@ -298,19 +281,20 @@ PCIMMIOBridgeState *pci_mmio_bridge_init(PCIBus *pci_bus,
     /* Store PCI bus reference */
     bridge->pci_bus = pci_bus;
 
-    /* Allocate backing memory */
-    bridge->shadow_hva = qemu_memalign(4096, size);
-    memset(bridge->shadow_hva, 0, size);
     bridge->shadow_gpa = gpa;
     bridge->shadow_size = size;
 
-    /* Initialize shadow buffer as IO region with callbacks */
-    memory_region_init_io(&bridge->shadow_mr, NULL,
-                          &pci_mmio_bridge_shadow_ops, bridge,
-                          "pci-mmio-bridge-shadow", size);
-
-    /* Add to system memory */
+    /* Allocate guest RAM for shadow buffer */
+    memory_region_init_ram(&bridge->shadow_mr, NULL,
+                           "pci-mmio-bridge-shadow", size,
+                           &error_fatal);
+    
+    /* Add to system memory at specified GPA */
     memory_region_add_subregion(get_system_memory(), gpa, &bridge->shadow_mr);
+    
+    /* Get host virtual address for direct access */
+    bridge->shadow_hva = memory_region_get_ram_ptr(&bridge->shadow_mr);
+    memset(bridge->shadow_hva, 0, size);
 
     /* Calculate queue depth (reserve first slot for metadata) */
     bridge->queue_depth = (size / sizeof(struct pci_mmio_command)) - 1;

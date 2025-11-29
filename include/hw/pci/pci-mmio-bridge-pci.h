@@ -20,9 +20,10 @@
 #define TYPE_PCI_MMIO_BRIDGE_PCI "pci-mmio-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(PCIMMIOBridgePCIState, PCI_MMIO_BRIDGE_PCI)
 
-/* PCI vendor/device IDs */
-#define PCI_VENDOR_ID_REDHAT_QEMU  0x1b36
-#define PCI_DEVICE_ID_MMIO_BRIDGE  0x0010
+/* PCI IDs are defined in include/hw/pci/pci.h:
+ * PCI_VENDOR_ID_REDHAT_QEMU = 0x1b36
+ * PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE = 0x0015
+ */
 
 /*
  * PCI MMIO Bridge Device State

@@ -8,7 +8,7 @@ PCI device in the guest, making it easy to discover.
 **IMPORTANT**: This device uses a **hybrid architecture** to support both
 guest discoverability AND VFIO DMA access:
 
-- PCI device for discovery (vendor 0x1b36, device 0x0010)
+- PCI device for discovery (vendor 0x1b36, device 0x0015)
 - Shadow buffer allocated in **guest RAM** (not PCI MMIO space)
 - GPA exposed via PCI config space vendor-specific registers
 
@@ -39,7 +39,7 @@ Device Properties
 ~~~~~~~~~~~~~~~~~
 
 - **Vendor ID**: 0x1b36 (Red Hat/QEMU)
-- **Device ID**: 0x0010 (PCI MMIO Bridge)
+- **Device ID**: 0x0015 (PCI MMIO Bridge)
 - **Class**: 0x08/0x80 (System Other)
 - **Shadow Buffer**: Guest RAM at configurable GPA
 - **Config Space**: Vendor registers expose GPA/size/depth
@@ -57,7 +57,7 @@ The device appears in standard PCI enumeration:
    # Linux
    lspci
    # Output:
-   # 00:04.0 System peripheral: Red Hat, Inc. Device 0010
+   # 00:04.0 System peripheral: Red Hat, Inc. Device 0015
 
    lspci -v -s 00:04.0
    # Shows PCI IDs but NO BARs (shadow buffer is in guest RAM)
@@ -161,7 +161,7 @@ Example PCI driver that discovers and uses the bridge:
    #include <linux/io.h>
    
    #define PCI_VENDOR_ID_REDHAT_QEMU  0x1b36
-   #define PCI_DEVICE_ID_MMIO_BRIDGE  0x0010
+   #define PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE  0x0015
    
    /* Config space offsets */
    #define CAP_OFFSET  0x40
@@ -427,7 +427,7 @@ Device Not Found
 .. code-block:: bash
 
    lspci | grep 1b36
-   # Should show: System peripheral: Red Hat, Inc. Device 0010
+   # Should show: System peripheral: Red Hat, Inc. Device 0015
 
 If missing:
 

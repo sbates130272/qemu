@@ -19,7 +19,7 @@ space. A traditional PCI BAR would NOT work for VFIO DMA.
 
 ```c
 /* 1. Discover PCI device */
-lspci  // Shows: "System peripheral: Red Hat, Inc. Device 0010"
+lspci  // Shows: "System peripheral: Red Hat, Inc. Device 0015"
 
 /* 2. Read shadow buffer GPA from PCI config space (offset 0x40) */
 uint32_t gpa_lo = pci_config_read(pdev, 0x40);

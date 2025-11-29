@@ -15,7 +15,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/pci/pci-mmio-bridge-pci.h"
-#include "hw/pci/pci.h"
+#include "hw/pci/pci.h"  /* For PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE */
 #include "hw/qdev-properties.h"
 #include "hw/resettable.h"
 #include "qapi/error.h"
@@ -39,14 +39,14 @@ static void pci_mmio_bridge_pci_realize(PCIDevice *pci_dev, Error **errp)
     Error *local_err = NULL;
 
     /* Set PCI config space */
-    pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_REDHAT_QEMU);
-    pci_config_set_device_id(pci_conf, PCI_DEVICE_ID_MMIO_BRIDGE);
+    pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_REDHAT);
+    pci_config_set_device_id(pci_conf, PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE);
     pci_config_set_class(pci_conf, PCI_CLASS_SYSTEM_OTHER);
     pci_config_set_revision(pci_conf, 0x01);
 
     /* Subsystem vendor/device ID */
     pci_set_word(pci_conf + PCI_SUBSYSTEM_VENDOR_ID,
-                 PCI_VENDOR_ID_REDHAT_QEMU);
+                 PCI_VENDOR_ID_REDHAT);
     pci_set_word(pci_conf + PCI_SUBSYSTEM_ID, 0x1100);
 
     /* Validate shadow_size */
@@ -152,8 +152,8 @@ static void pci_mmio_bridge_pci_class_init(ObjectClass *klass,
 
     k->realize = pci_mmio_bridge_pci_realize;
     k->exit = pci_mmio_bridge_pci_exit;
-    k->vendor_id = PCI_VENDOR_ID_REDHAT_QEMU;
-    k->device_id = PCI_DEVICE_ID_MMIO_BRIDGE;
+    k->vendor_id = PCI_VENDOR_ID_REDHAT;
+    k->device_id = PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE;
     k->class_id = PCI_CLASS_SYSTEM_OTHER;
     k->revision = 0x01;
 
