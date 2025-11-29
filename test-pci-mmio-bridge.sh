@@ -1,0 +1,134 @@
+#!/bin/bash
+# Test PCI MMIO Bridge with VFIO device and emulated NVMe
+# Architecture: Hybrid PCI device (guest RAM shadow buffer + config space)
+
+set -e
+
+QEMU="/home/stebates/Projects/qemu/build/qemu-system-x86_64"
+IMAGE="/home/stebates/Projects/qemu-minimal/images/rocm-axiio.qcow2"
+VFIO_PCI="10:00.0"
+SSH_PORT="${SSH_PORT:-2222}"  # SSH forwarding port (default: 2222)
+
+echo "==================================================================="
+echo "PCI MMIO Bridge Test - Hybrid Architecture"
+echo "==================================================================="
+echo ""
+echo "Architecture:"
+echo "  - PCI device for discovery (Vendor 0x1b36, Device 0x0015)"
+echo "  - Shadow buffer in guest RAM (not BAR/MMIO)"
+echo "  - GPA exposed via PCI config space offset 0x40"
+echo "  - VFIO device can DMA to shadow_gpa"
+echo ""
+echo "Devices:"
+echo "  - PCI MMIO Bridge: shadow-gpa=0x80000000, size=8192"
+echo "  - PCI Test Device: with RAM BAR for testing"
+echo "  - Emulated NVMe: nvme0, 4GB"
+echo "  - VFIO device: $VFIO_PCI"
+echo ""
+echo "Networking:"
+echo "  - SSH forwarding: localhost:$SSH_PORT -> guest:22"
+echo "  - Connect with: ssh -p $SSH_PORT user@localhost"
+echo ""
+echo "File Sharing:"
+echo "  - Host: /home/stebates/Projects"
+echo "  - Mount tag: 'hostfs'"
+echo "  - In guest: sudo mount -t 9p -o trans=virtio hostfs /mnt/hostfs"
+echo ""
+
+# Check if image exists
+if [ ! -f "$IMAGE" ]; then
+    echo "ERROR: Image file not found: $IMAGE"
+    exit 1
+fi
+
+# Check if VFIO device exists
+if [ ! -e "/sys/bus/pci/devices/0000:$VFIO_PCI" ]; then
+    echo "WARNING: VFIO device $VFIO_PCI not found"
+    echo "  Continuing anyway (you can still test emulated devices)"
+    echo ""
+fi
+
+# Create temporary NVMe backing file
+NVME_IMG="/tmp/nvme-test-$$.img"
+echo "Creating temporary NVMe backing file: $NVME_IMG"
+dd if=/dev/zero of="$NVME_IMG" bs=1M count=4096 2>/dev/null
+echo ""
+
+echo "==================================================================="
+echo "Starting QEMU..."
+echo "==================================================================="
+echo ""
+echo "SSH Access:"
+echo "  ssh -p $SSH_PORT user@localhost"
+echo "  (or from another terminal while VM is running)"
+echo ""
+echo "Serial Console:"
+echo "  - Currently viewing serial console"
+echo "  - Press Ctrl-A then C to toggle to QEMU monitor"
+echo "  - Press Ctrl-A then X to exit QEMU"
+echo ""
+echo "Guest can discover devices via lspci:"
+echo "  00:04.0 - MMIO Bridge (Red Hat, Inc. Device 0015)"
+echo "  00:05.0 - PCI Test Device (Red Hat, Inc. Device 0005)"
+echo "  00:06.0 - NVMe (emulated)"
+echo ""
+echo "Read shadow buffer GPA from MMIO Bridge:"
+echo "  setpci -s 00:04.0 40.L  # GPA low = 0x80000000"
+echo "  setpci -s 00:04.0 44.L  # GPA high = 0x00000000"
+echo ""
+echo "Test MMIO bridge with pci-testdev:"
+echo "  Target BDF: 0x0500 (00:05.0)"
+echo "  BAR 0: Memory BAR (1MB RAM, safe for read/write)"
+echo ""
+echo "To use a different SSH port: SSH_PORT=3333 $0"
+echo "==================================================================="
+echo ""
+
+$QEMU \
+    -machine q35,accel=kvm \
+    -cpu EPYC \
+    -m 8G \
+    -smp 4 \
+    -drive file="$IMAGE",if=virtio,format=qcow2 \
+    -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
+    -device virtio-net-pci,netdev=net0 \
+    -virtfs local,path=/home/stebates/Projects,mount_tag=hostfs,security_model=none,id=hostfs \
+    -device pci-mmio-bridge,id=mmio-bridge,\
+shadow-gpa=0x80000000,\
+shadow-size=8192,\
+poll-interval-ns=1000000,\
+addr=4.0 \
+    -device pci-testdev,membar=1M,membar-backed=on,addr=5.0 \
+    -drive id=nvme0,file="$NVME_IMG",if=none,format=raw \
+    -device nvme,serial=nvme0,drive=nvme0 \
+    -device vfio-pci,host=$VFIO_PCI,id=vfio0 \
+    -serial mon:stdio \
+    -display none \
+    -trace pci_mmio_bridge_pci_realize \
+    -trace pci_mmio_bridge_init \
+    -trace pci_mmio_bridge_write \
+    -trace pci_mmio_bridge_read \
+    -trace pci_mmio_bridge_poll_processed \
+    -trace pci_mmio_bridge_device_not_found \
+    -trace pci_mmio_bridge_write_failed \
+    -trace pci_mmio_bridge_read_failed \
+    -trace pci_nvme_mmio_write \
+    -trace pci_nvme_mmio_doorbell_sq \
+    -trace pci_nvme_admin_cmd \
+    -trace pci_nvme_io_cmd \
+    -trace pci_nvme_write \
+    -trace pci_nvme_read \
+    -trace pci_nvme_dma_read \
+    -trace pci_nvme_err_invalid_create_sq_sqid \
+    -trace pci_nvme_err_invalid_create_sq_addr \
+    -trace pci_nvme_err_invalid_create_cq_cqid \
+    -trace pci_nvme_err_invalid_create_cq_addr \
+    -trace pci_nvme_err_addr_read \
+    -trace pci_nvme_err_addr_write
+
+# Cleanup
+echo ""
+echo "Cleaning up temporary NVMe image..."
+rm -f "$NVME_IMG"
+echo "Done."
+

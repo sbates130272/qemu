@@ -84,8 +84,7 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
                                              struct pci_mmio_command *cmd)
 {
     PCIDevice *target;
-    MemoryRegion *target_mr;
-    uint64_t value;
+    uint64_t value = 0;
     MemTxResult result;
 
     /* Validate command type */
@@ -117,9 +116,9 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
         return;
     }
 
-    /* Get target BAR memory region */
-    target_mr = target->io_regions[cmd->target_bar].memory;
-    if (!target_mr || !memory_region_is_mapped(target_mr)) {
+    /* Get target BAR address (GPA where it's mapped in MMIO space) */
+    hwaddr bar_addr = pci_get_bar_addr(target, cmd->target_bar);
+    if (bar_addr == PCI_BAR_UNMAPPED) {
         qatomic_set(&cmd->status, PCI_MMIO_STATUS_ERROR);
         smp_wmb();
         trace_pci_mmio_bridge_bar_not_mapped(cmd->target_bdf, cmd->target_bar);
@@ -134,12 +133,15 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
         return;
     }
 
-    /* Execute the operation */
+    /* Calculate full MMIO address (BAR base + offset) */
+    hwaddr mmio_addr = bar_addr + cmd->offset;
+
+    /* Execute the operation using address_space to access MMIO space */
     switch (cmd->command) {
     case PCI_MMIO_CMD_WRITE:
-        result = memory_region_dispatch_write(target_mr, cmd->offset,
-                                               cmd->value, size_memop(cmd->size),
-                                               MEMTXATTRS_UNSPECIFIED);
+        result = address_space_write(&address_space_memory, mmio_addr,
+                                      MEMTXATTRS_UNSPECIFIED,
+                                      &cmd->value, cmd->size);
         if (result == MEMTX_OK) {
             qatomic_set(&cmd->status, PCI_MMIO_STATUS_COMPLETE);
             smp_wmb();
@@ -156,9 +158,9 @@ static void pci_mmio_bridge_execute_command(PCIMMIOBridgeState *bridge,
         break;
 
     case PCI_MMIO_CMD_READ:
-        result = memory_region_dispatch_read(target_mr, cmd->offset,
-                                              &value, size_memop(cmd->size),
-                                              MEMTXATTRS_UNSPECIFIED);
+        result = address_space_read(&address_space_memory, mmio_addr,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     &value, cmd->size);
         if (result == MEMTX_OK) {
             cmd->value = value;
             smp_wmb();  /* Ensure value is visible before status update */
