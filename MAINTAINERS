@@ -2161,6 +2161,14 @@ F: docs/pci*
 F: docs/specs/*pci*
 F: docs/system/sriov.rst
 
+PCI MMIO Bridge
+M: Michael S. Tsirkin <mst@redhat.com>
+S: Supported
+F: hw/pci/pci-mmio-bridge.c
+F: include/hw/pci/pci-mmio-bridge.h
+F: tests/qtest/pci-mmio-bridge-test.c
+F: docs/system/devices/pci-mmio-bridge.rst
+
 PCIE DOE
 M: Huai-Cheng Kuo <hchkuo@avery-design.com.tw>
 S: Supported
