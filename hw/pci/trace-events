@@ -28,3 +28,21 @@ pcie_cap_slot_write_config(const char *parent, const char *child, const char *pd
 
 # shpc.c
 shpc_slot_command(const char *parent, int pci_slot, const char *child, const char *old_pic, const char *new_pic, const char *old_aic, const char *new_aic, const char *old_state, const char *new_state) "%s[%d] > %s: pic: %s->%s, aic: %s->%s, state: %s->%s"
+
+# pci-mmio-bridge.c
+pci_mmio_bridge_init(uint64_t gpa, uint32_t size, uint32_t queue_depth, uint64_t poll_interval_ns) "gpa=0x%"PRIx64" size=%u queue_depth=%u poll_interval=%"PRIu64"ns"
+pci_mmio_bridge_cleanup(uint64_t total_commands, uint64_t total_writes, uint64_t total_reads, uint64_t total_errors) "total_commands=%"PRIu64" writes=%"PRIu64" reads=%"PRIu64" errors=%"PRIu64
+pci_mmio_bridge_set_enabled(bool enabled) "enabled=%d"
+pci_mmio_bridge_write(uint16_t bdf, uint8_t bar, uint32_t offset, uint64_t value, uint8_t size) "BDF=0x%04x BAR=%u offset=0x%x value=0x%"PRIx64" size=%u"
+pci_mmio_bridge_read(uint16_t bdf, uint8_t bar, uint32_t offset, uint64_t value, uint8_t size) "BDF=0x%04x BAR=%u offset=0x%x value=0x%"PRIx64" size=%u"
+pci_mmio_bridge_write_failed(uint16_t bdf, uint8_t bar, uint32_t offset, int result) "BDF=0x%04x BAR=%u offset=0x%x result=%d"
+pci_mmio_bridge_read_failed(uint16_t bdf, uint8_t bar, uint32_t offset, int result) "BDF=0x%04x BAR=%u offset=0x%x result=%d"
+pci_mmio_bridge_device_not_found(uint16_t bdf) "BDF=0x%04x not found"
+pci_mmio_bridge_invalid_bar(uint16_t bdf, uint8_t bar) "BDF=0x%04x invalid BAR=%u"
+pci_mmio_bridge_bar_not_mapped(uint16_t bdf, uint8_t bar) "BDF=0x%04x BAR=%u not mapped"
+pci_mmio_bridge_invalid_command(uint8_t command) "invalid command=%u"
+pci_mmio_bridge_invalid_size(uint8_t size) "invalid size=%u"
+pci_mmio_bridge_poll_processed(uint32_t count) "processed %u commands"
+pci_mmio_bridge_realize(uint64_t gpa, uint32_t size, uint32_t queue_depth) "shadow_gpa=0x%"PRIx64" size=%u queue_depth=%u"
+pci_mmio_bridge_exit(uint64_t commands, uint64_t writes, uint64_t reads, uint64_t errors) "commands=%"PRIu64" writes=%"PRIu64" reads=%"PRIu64" errors=%"PRIu64
+pci_mmio_bridge_reset(void) "resetting bridge state"
