@@ -100,31 +100,13 @@ poll-interval-ns=1000000,\
 addr=4.0 \
     -device pci-testdev,membar=1M,membar-backed=on,addr=5.0 \
     -drive id=nvme0,file="$NVME_IMG",if=none,format=raw \
-    -device nvme,serial=nvme0,drive=nvme0 \
+    -device nvme,serial=nvme0,drive=nvme0,ioeventfd=off,dbcs=off \
     -device vfio-pci,host=$VFIO_PCI,id=vfio0 \
+    -device vfio-pci,host=c2:00.0,id=vfio1 \
     -serial mon:stdio \
     -display none \
-    -trace pci_mmio_bridge_pci_realize \
-    -trace pci_mmio_bridge_init \
-    -trace pci_mmio_bridge_write \
-    -trace pci_mmio_bridge_read \
-    -trace pci_mmio_bridge_poll_processed \
-    -trace pci_mmio_bridge_device_not_found \
-    -trace pci_mmio_bridge_write_failed \
-    -trace pci_mmio_bridge_read_failed \
-    -trace pci_nvme_mmio_write \
-    -trace pci_nvme_mmio_doorbell_sq \
-    -trace pci_nvme_admin_cmd \
-    -trace pci_nvme_io_cmd \
-    -trace pci_nvme_write \
-    -trace pci_nvme_read \
-    -trace pci_nvme_dma_read \
-    -trace pci_nvme_err_invalid_create_sq_sqid \
-    -trace pci_nvme_err_invalid_create_sq_addr \
-    -trace pci_nvme_err_invalid_create_cq_cqid \
-    -trace pci_nvme_err_invalid_create_cq_addr \
-    -trace pci_nvme_err_addr_read \
-    -trace pci_nvme_err_addr_write
+    -trace pci_mmio_* \
+    -trace pci_nvme_*
 
 # Cleanup
 echo ""

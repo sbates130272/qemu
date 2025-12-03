@@ -1,0 +1,26 @@
+# Makefile for nvme_prp1_inject kernel module
+
+obj-m += nvme_prp1_inject.o
+
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+install:
+	sudo insmod nvme_prp1_inject.ko
+
+uninstall:
+	sudo rmmod nvme_prp1_inject
+
+reload: uninstall install
+
+logs:
+	dmesg | grep nvme_prp1_inject | tail -50
+
+.PHONY: all clean install uninstall reload logs
+

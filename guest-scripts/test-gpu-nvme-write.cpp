@@ -462,27 +462,50 @@ int main(int argc, char **argv)
     printf("  CQ: virt=%p phys=0x%lx size=%zu\n", cq_virt, cq_phys, cq_size);
     printf("  SQ: virt=%p phys=0x%lx size=%zu\n", sq_virt, sq_phys, sq_size);
     
+    /* Try to delete existing queues first (in case left from crashed run) */
+    del_sq.opcode = NVME_ADMIN_DELETE_SQ;
+    del_sq.cdw10 = qid;
+    ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &del_sq);  /* Ignore errors */
+    
+    del_cq.opcode = NVME_ADMIN_DELETE_CQ;
+    del_cq.cdw10 = qid;
+    ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &del_cq);  /* Ignore errors */
+    
     /* Create CQ via admin command */
+    memset(&cq_cmd, 0, sizeof(cq_cmd));
     cq_cmd.opcode = NVME_ADMIN_CREATE_CQ;
     cq_cmd.addr = cq_phys;
     cq_cmd.cdw10 = ((QUEUE_SIZE - 1) << 16) | qid;  /* QSIZE | QID */
     cq_cmd.cdw11 = 0x1;  /* Physically contiguous */
     
     if (ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &cq_cmd) < 0) {
-        perror("CREATE_CQ");
-        printf("  Note: QID %u may already exist. Try a different QID.\n", qid);
+        perror("CREATE_CQ ioctl");
+        goto cleanup;
+    }
+    if (cq_cmd.result != 0) {
+        fprintf(stderr, "CREATE_CQ failed: status=0x%x\n", cq_cmd.result);
+        printf("  QID %u may be invalid or beyond controller limits\n", qid);
         goto cleanup;
     }
     printf("  ✅ Completion Queue created\n");
     
     /* Create SQ via admin command */
+    memset(&sq_cmd, 0, sizeof(sq_cmd));
     sq_cmd.opcode = NVME_ADMIN_CREATE_SQ;
     sq_cmd.addr = sq_phys;
     sq_cmd.cdw10 = ((QUEUE_SIZE - 1) << 16) | qid;  /* QSIZE | QID */
     sq_cmd.cdw11 = (qid << 16) | 0x1;  /* CQID | Physically contiguous */
     
     if (ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &sq_cmd) < 0) {
-        perror("CREATE_SQ");
+        perror("CREATE_SQ ioctl");
+        /* Delete CQ on failure */
+        del_cq.opcode = NVME_ADMIN_DELETE_CQ;
+        del_cq.cdw10 = qid;
+        ioctl(nvme_fd, NVME_IOCTL_ADMIN_CMD, &del_cq);
+        goto cleanup;
+    }
+    if (sq_cmd.result != 0) {
+        fprintf(stderr, "CREATE_SQ failed: status=0x%x\n", sq_cmd.result);
         /* Delete CQ on failure */
         del_cq.opcode = NVME_ADMIN_DELETE_CQ;
         del_cq.cdw10 = qid;
@@ -670,7 +693,7 @@ int main(int argc, char **argv)
     } else {
         printf("  ❌ Bridge doorbell write failed (status=%u)\n\n", bridge_cmd->status);
     }
-    
+    sleep(1);
     printf("=================================================\n");
     printf("Summary\n");
     printf("=================================================\n");

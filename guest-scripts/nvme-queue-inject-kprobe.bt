@@ -1,0 +1,67 @@
+#!/usr/bin/env bpftrace
+/*
+ * NVMe Queue Creation PRP1 Injection (kprobe version)
+ * 
+ * This version uses kprobe instead of kfunc for broader compatibility.
+ * 
+ * Usage:
+ *   sudo bpftrace nvme-queue-inject-kprobe.bt
+ */
+
+kprobe:nvme_submit_user_cmd
+{
+    // Register layout for x86_64 calling convention:
+    // RDI (arg0) = request_queue *q
+    // RSI (arg1) = nvme_command *cmd
+    // RDX (arg2) = u64 ubuffer
+    // RCX (arg3) = unsigned bufflen
+    
+    $cmd = (uint64_t)reg("si");     // cmd pointer
+    $ubuffer = reg("dx");            // ubuffer (queue physical address)
+    $bufflen = reg("cx");            // bufflen
+    
+    // Read opcode from nvme_command structure
+    // struct nvme_command { u8 opcode; ... }
+    $opcode = *(uint8_t *)$cmd;
+    
+    // Check if CREATE_CQ (0x05) or CREATE_SQ (0x01) with no data transfer
+    if (($opcode == 0x05 || $opcode == 0x01) && $bufflen == 0 && $ubuffer != 0) {
+        printf("=== NVMe Queue Creation Detected ===\n");
+        printf("Opcode: 0x%02x (%s)\n", $opcode,
+               $opcode == 0x05 ? "CREATE_CQ" : "CREATE_SQ");
+        printf("Queue address (ubuffer): 0x%016lx\n", $ubuffer);
+        printf("Buffer length: %u\n", $bufflen);
+        
+        // struct nvme_command layout (from include/linux/nvme.h):
+        // Offset 0x00: u8 opcode
+        // Offset 0x01: u8 flags
+        // ...
+        // Offset 0x18 (24): union dptr {
+        //     struct { u64 prp1; u64 prp2; }
+        // }
+        
+        $prp1_offset = 24;  // PRP1 is at offset 24 in nvme_command
+        $prp1_addr = $cmd + $prp1_offset;
+        
+        // Read current PRP1 value
+        $old_prp1 = *(uint64_t *)$prp1_addr;
+        printf("Original PRP1: 0x%016lx\n", $old_prp1);
+        
+        // **CRITICAL**: BPF cannot directly write to kernel memory!
+        // This is a limitation. We need a different approach.
+        printf("⚠️  WARNING: bpftrace cannot modify kernel memory\n");
+        printf("   Consider using a kernel module or eBPF CO-RE program\n");
+        
+        // Instead, just log what we would inject
+        printf("Would inject: 0x%016lx into PRP1\n", $ubuffer);
+    }
+}
+
+BEGIN
+{
+    printf("NVMe Queue Creation Monitor (kprobe)\n");
+    printf("====================================\n");
+    printf("Note: This version can only observe, not modify\n");
+    printf("Monitoring nvme_submit_user_cmd...\n\n");
+}
+

@@ -7,7 +7,7 @@ DRM_CFLAGS = -I/usr/include/drm -I/usr/include/libdrm
 HSA_LIBS = -lhsa-runtime64
 DRM_LIBS = -ldrm -ldrm_amdgpu
 
-all: test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct
+all: test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue test-nvme-ioctl-bytes check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct
 
 test-gpu-mmio-bridge: test-gpu-mmio-bridge.cpp
 	$(HIPCC) $(CFLAGS) -o $@ $<
@@ -60,8 +60,11 @@ test-bar-direct: test-bar-direct.cpp
 nvme-create-queue: nvme-create-queue.cpp
 	$(CXX) $(CFLAGS) -o $@ $<
 
+test-nvme-ioctl-bytes: test-nvme-ioctl-bytes.c
+	$(CXX) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct
+	rm -f test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue test-nvme-ioctl-bytes check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct
 
 .PHONY: all clean
 

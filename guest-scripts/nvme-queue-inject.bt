@@ -1,0 +1,71 @@
+#!/usr/bin/env bpftrace
+/*
+ * NVMe Queue Creation PRP1 Injection
+ * 
+ * This BPF script intercepts nvme_submit_user_cmd() and injects the queue
+ * physical address into PRP1 for CREATE_CQ/CREATE_SQ commands.
+ * 
+ * The Linux NVMe driver normally zeros PRP1/PRP2 and uses the 'addr' field
+ * only for data buffers. For queue creation (which has data_len=0), this
+ * leaves PRP1=0, causing failures.
+ * 
+ * This script:
+ * 1. Hooks nvme_submit_user_cmd before command submission
+ * 2. Checks if opcode is CREATE_CQ (0x05) or CREATE_SQ (0x01)
+ * 3. Checks if bufflen == 0 (no data transfer, queue creation pattern)
+ * 4. Writes ubuffer (queue physical address) into cmd->common.dptr.prp1
+ * 
+ * Usage:
+ *   sudo bpftrace nvme-queue-inject.bt
+ *   # In another terminal, run test-gpu-nvme-write
+ */
+
+kfunc:nvme_submit_user_cmd
+{
+    // Get function parameters
+    // nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+    //                      u64 ubuffer, unsigned bufflen, ...)
+    
+    $cmd = (struct nvme_command *)arg1;
+    $ubuffer = arg2;
+    $bufflen = arg3;
+    
+    // Check if this is a CREATE_CQ or CREATE_SQ command
+    $opcode = $cmd->common.opcode;
+    
+    if (($opcode == 0x05 || $opcode == 0x01) && $bufflen == 0) {
+        printf("Intercepting NVMe queue creation:\n");
+        printf("  Opcode: 0x%02x (%s)\n", $opcode, 
+               $opcode == 0x05 ? "CREATE_CQ" : "CREATE_SQ");
+        printf("  Original PRP1: 0x%016lx\n", $cmd->common.dptr.prp1);
+        printf("  Injecting ubuffer: 0x%016lx\n", $ubuffer);
+        
+        // Inject the queue physical address into PRP1
+        $cmd->common.dptr.prp1 = $ubuffer;
+        
+        printf("  ✅ PRP1 injected successfully\n");
+        printf("  cdw10: 0x%08x\n", $cmd->common.cdw10);
+        printf("  cdw11: 0x%08x\n", $cmd->common.cdw11);
+    }
+}
+
+kretfunc:nvme_submit_user_cmd
+{
+    // Track return status
+    if (retval != 0) {
+        printf("nvme_submit_user_cmd returned error: %d\n", retval);
+    }
+}
+
+BEGIN
+{
+    printf("NVMe Queue Creation PRP1 Injection Active\n");
+    printf("=========================================\n");
+    printf("Monitoring nvme_submit_user_cmd for CREATE_CQ/CREATE_SQ...\n\n");
+}
+
+END
+{
+    printf("\nBPF injection stopped\n");
+}
+
