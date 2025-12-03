@@ -1,0 +1,14 @@
+kernel/*.o
+kernel/*.ko
+kernel/*.mod
+kernel/*.mod.c
+kernel/*.cmd
+kernel/.*.cmd
+kernel/.*.mod.cmd
+kernel/.*.mod.o.cmd
+kernel/.*.mod.o
+kernel/.*.mod.o.cmd
+kernel/Module.symvers
+kernel/modules.order
+user/test-gpu-nvme-write
+
