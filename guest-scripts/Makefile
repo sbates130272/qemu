@@ -7,7 +7,7 @@ DRM_CFLAGS = -I/usr/include/drm -I/usr/include/libdrm
 HSA_LIBS = -lhsa-runtime64
 DRM_LIBS = -ldrm -ldrm_amdgpu
 
-all: test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue test-nvme-ioctl-bytes check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct
+all: test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue test-nvme-ioctl-bytes check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct explore-vram-p2p get-vram-physical
 
 test-gpu-mmio-bridge: test-gpu-mmio-bridge.cpp
 	$(HIPCC) $(CFLAGS) -o $@ $<
@@ -63,8 +63,14 @@ nvme-create-queue: nvme-create-queue.cpp
 test-nvme-ioctl-bytes: test-nvme-ioctl-bytes.c
 	$(CXX) $(CFLAGS) -o $@ $<
 
+explore-vram-p2p: explore-vram-p2p.cpp
+	$(HIPCC) $(CFLAGS) $(DRM_CFLAGS) $(DRM_LIBS) -o $@ $<
+
+get-vram-physical: get-vram-physical.cpp
+	$(HIPCC) $(CFLAGS) $(DRM_CFLAGS) $(DRM_LIBS) -o $@ $<
+
 clean:
-	rm -f test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue test-nvme-ioctl-bytes check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct
+	rm -f test-gpu-mmio-bridge test-bridge-pci-testdev test-gpu-bridge-testdev test-gpu-bar0-mmio test-gpu-nvme-write nvme-create-queue test-nvme-ioctl-bytes check-gpu-writes find-gpu-physical-addr find-hip-allocated-gpa test-amdgpu-userptr simple-test simple-test-mem diagnose-gpu-mapping dump-shadow check-sizes test-gpu-pattern test-bar-direct explore-vram-p2p get-vram-physical
 
 .PHONY: all clean
 
