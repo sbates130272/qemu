@@ -342,6 +342,7 @@ int main(int argc, char **argv)
     uint8_t nvme_bar = 0;
     uint32_t bridge_size = 0, queue_depth = 0;
     uint32_t doorbell_stride = 0, doorbell_base = 0x1000, stride_bytes = 0, doorbell_offset = 0;
+    uint32_t last_prod_idx = 0, slot = 0;
     const char *nvme_dev = NULL;
     size_t cq_size = QUEUE_SIZE * 16;
     size_t sq_size = QUEUE_SIZE * 64;
@@ -399,21 +400,37 @@ int main(int argc, char **argv)
     
     /* Find NVMe BDF from sysfs */
     char sysfs_path[256];
+    char ctrl_name[32];
     const char *nvme_name = strrchr(nvme_dev, '/');
     if (nvme_name) nvme_name++;
     else nvme_name = nvme_dev;
     
+    /* Strip namespace (e.g., nvme0n1 -> nvme0) */
+    strncpy(ctrl_name, nvme_name, sizeof(ctrl_name) - 1);
+    ctrl_name[sizeof(ctrl_name) - 1] = '\0';
+    char *n_pos = strrchr(ctrl_name, 'n');  /* Find LAST 'n' */
+    if (n_pos && n_pos > ctrl_name && *(n_pos - 1) >= '0' && *(n_pos - 1) <= '9') {
+        *n_pos = '\0';  /* Truncate at 'n' to get controller name */
+    }
+    
     /* Read PCI address from sysfs */
-    snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/nvme/%s/address", nvme_name);
+    snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/nvme/%s/address", ctrl_name);
     FILE *f = fopen(sysfs_path, "r");
     if (f) {
-        unsigned int bus, dev, func;
-        if (fscanf(f, "%x:%x:%x.%x", &bus, &bus, &dev, &func) == 4) {
+        unsigned int domain, bus, dev, func;
+        if (fscanf(f, "%x:%x:%x.%x", &domain, &bus, &dev, &func) == 4) {
             nvme_bdf = (bus << 8) | (dev << 3) | func;
+            printf("  Read from %s: domain=0x%x bus=0x%x dev=0x%x func=0x%x\n", 
+                   sysfs_path, domain, bus, dev, func);
+        } else {
+            fprintf(stderr, "  ERROR: Failed to parse %s\n", sysfs_path);
         }
         fclose(f);
+    } else {
+        fprintf(stderr, "  ERROR: Could not open %s\n", sysfs_path);
     }
     if (nvme_bdf == 0) {
+        fprintf(stderr, "  WARNING: Using fallback BDF 0x0300\n");
         nvme_bdf = 0x0300;  /* Default fallback */
     }
     printf("  NVMe BDF: 0x%04x\n\n", nvme_bdf);
@@ -681,7 +698,15 @@ int main(int argc, char **argv)
     /* Step 11: Wait for MMIO bridge to process doorbell write */
     printf("Step 11: Waiting for MMIO bridge to process doorbell write...\n");
     meta = (struct pci_mmio_ring_meta *)bridge_cpu;
-    bridge_cmd = (struct pci_mmio_command *)((char *)bridge_cpu + 16);
+    
+    /* Find the slot that GPU wrote to (producer_idx was incremented after write) */
+    last_prod_idx = meta->producer_idx - 1;
+    slot = last_prod_idx % queue_depth;
+    bridge_cmd = (struct pci_mmio_command *)((char *)bridge_cpu + 16 + 
+                                             slot * sizeof(struct pci_mmio_command));
+    
+    printf("  Checking slot %u (producer_idx=%u, queue_depth=%u)\n", 
+           slot, meta->producer_idx, queue_depth);
     
     timeout = 100;
     while (bridge_cmd->status == PCI_MMIO_STATUS_PENDING && timeout-- > 0) {

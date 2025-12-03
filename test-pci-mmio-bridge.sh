@@ -4,7 +4,8 @@
 
 set -e
 
-QEMU="/home/stebates/Projects/qemu/build/qemu-system-x86_64"
+#QEMU="/home/stebates/Projects/qemu/build/qemu-system-x86_64"\
+QEMU="/opt/qemu-pci-mmio-submit/bin/qemu-system-x86_64"
 IMAGE="/home/stebates/Projects/qemu-minimal/images/rocm-axiio.qcow2"
 VFIO_PCI="10:00.0"
 SSH_PORT="${SSH_PORT:-2222}"  # SSH forwarding port (default: 2222)

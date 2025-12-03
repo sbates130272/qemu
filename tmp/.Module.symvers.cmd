@@ -1,0 +1,1 @@
+savedcmd_/home/stebates/Projects/qemu/tmp/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/stebates/Projects/qemu/tmp/Module.symvers -T /home/stebates/Projects/qemu/tmp/modules.order -i Module.symvers -e 
