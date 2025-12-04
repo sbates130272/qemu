@@ -208,6 +208,7 @@
 #include "hw/pci/pcie_sriov.h"
 #include "system/spdm-socket.h"
 #include "migration/vmstate.h"
+#include "exec/cpu-common.h"
 
 #include "nvme.h"
 #include "dif.h"
@@ -826,9 +827,96 @@ static uint16_t nvme_map_addr_pmr(NvmeCtrl *n, QEMUIOVector *iov, hwaddr addr,
     return NVME_SUCCESS;
 }
 
+/*
+ * GPU VRAM P2P DMA support for emulated NVMe
+ *
+ * Detects if a guest physical address falls within a VFIO passthrough
+ * GPU's VRAM BAR range. This allows the emulated NVMe controller to
+ * perform DMA directly from GPU VRAM for peer-to-peer transfers.
+ *
+ * Note: This range detection is a proof-of-concept. A production
+ * implementation should discover VFIO device BARs dynamically or
+ * use device properties to configure the range.
+ */
+static inline bool nvme_addr_is_vram(hwaddr addr, hwaddr len)
+{
+    hwaddr hi = addr + len - 1;
+    
+    /*
+     * Typical AMD GPU VRAM BAR range in guest physical address space.
+     * This matches a 16GB BAR starting at 0xc400000000.
+     * TODO: Make this configurable via device property.
+     */
+    return (addr >= 0xc400000000ULL && hi < 0xc800000000ULL);
+}
+
+/*
+ * Map GPU VRAM address for P2P DMA.
+ *
+ * For addresses in the VRAM range, this function directly maps the
+ * memory region (typically a mmap'd VFIO device BAR) into the I/O
+ * vector instead of going through the normal PCI DMA path.
+ *
+ * This enables peer-to-peer DMA between a passthrough GPU and the
+ * emulated NVMe controller.
+ */
+static uint16_t nvme_map_addr_vram(NvmeCtrl *n, QEMUIOVector *iov, hwaddr addr,
+                                   size_t len)
+{
+    MemoryRegion *mr;
+    hwaddr xlat, remaining;
+    void *host_ptr;
+    
+    if (!len) {
+        return NVME_SUCCESS;
+    }
+
+    trace_pci_nvme_vram_p2p_read(addr, len);
+
+    /*
+     * Translate the guest physical address to find the backing memory region.
+     * For VFIO passthrough GPUs, this should resolve to the mmap'd BAR.
+     */
+    mr = address_space_translate(&address_space_memory, addr, &xlat,
+                                 &remaining, false, MEMTXATTRS_UNSPECIFIED);
+    
+    if (!mr) {
+        return NVME_DATA_TRAS_ERROR;
+    }
+
+    trace_pci_nvme_vram_p2p_mr_found(addr, memory_region_name(mr),
+                                     memory_region_size(mr),
+                                     memory_region_is_ram(mr));
+
+    /*
+     * Verify the memory region is suitable for direct access.
+     * VFIO device BARs are typically backed by RAM (mmap'd device memory)
+     * and have a ram_block.
+     */
+    if (!memory_region_is_ram(mr) || !mr->ram_block) {
+        return NVME_DATA_TRAS_ERROR;
+    }
+
+    /*
+     * Get the host virtual address of the mapped BAR and adjust for
+     * the offset within the memory region.
+     */
+    host_ptr = memory_region_get_ram_ptr(mr);
+    if (!host_ptr) {
+        return NVME_DATA_TRAS_ERROR;
+    }
+    
+    host_ptr = (void*)((uintptr_t)host_ptr + xlat);
+    trace_pci_nvme_vram_p2p_direct_ptr(host_ptr, xlat);
+    
+    /* Add the memory directly to the I/O vector - no copy needed */
+    qemu_iovec_add(iov, host_ptr, len);
+    return NVME_SUCCESS;
+}
+
 static uint16_t nvme_map_addr(NvmeCtrl *n, NvmeSg *sg, hwaddr addr, size_t len)
 {
-    bool cmb = false, pmr = false;
+    bool cmb = false, pmr = false, vram = false;
 
     if (!len) {
         return NVME_SUCCESS;
@@ -844,8 +932,11 @@ static uint16_t nvme_map_addr(NvmeCtrl *n, NvmeSg *sg, hwaddr addr, size_t len)
         cmb = true;
     } else if (nvme_addr_is_pmr(n, addr)) {
         pmr = true;
+    } else if (nvme_addr_is_vram(addr, len)) {
+        vram = true;
     }
 
+    /* CMB and PMR are memory-mapped, VRAM uses IOV with custom mapping */
     if (cmb || pmr) {
         if (sg->flags & NVME_SG_DMA) {
             return NVME_INVALID_USE_OF_CMB | NVME_DNR;
@@ -862,6 +953,20 @@ static uint16_t nvme_map_addr(NvmeCtrl *n, NvmeSg *sg, hwaddr addr, size_t len)
         }
     }
 
+    /* VRAM: treat as IOV with custom mapping, not DMA */
+    if (vram) {
+        if (sg->flags & NVME_SG_DMA) {
+            return NVME_INVALID_USE_OF_CMB | NVME_DNR;
+        }
+
+        if (sg->iov.niov + 1 > IOV_MAX) {
+            goto max_mappings_exceeded;
+        }
+
+        return nvme_map_addr_vram(n, &sg->iov, addr, len);
+    }
+
+    /* Regular DMA path for system RAM */
     if (!(sg->flags & NVME_SG_DMA)) {
         return NVME_INVALID_USE_OF_CMB | NVME_DNR;
     }
@@ -882,7 +987,9 @@ max_mappings_exceeded:
 
 static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
 {
-    return !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr));
+    /* VRAM, CMB, and PMR are not DMA - they use direct memory mapping */
+    return !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr) ||
+             nvme_addr_is_vram(addr, 1));
 }
 
 static uint16_t nvme_map_prp(NvmeCtrl *n, NvmeSg *sg, uint64_t prp1,
