@@ -1658,6 +1658,9 @@ static void nvme_post_cqes(void *opaque)
         req->cqe.status = cpu_to_le16((req->status << 1) | cq->phase);
         req->cqe.sq_head = cpu_to_le16(sq->head);
         addr = cq->dma_addr + (cq->tail << NVME_CQES);
+        trace_pci_nvme_cqe_dma_write(nvme_cid(req), cq->cqid, addr,
+                                     le32_to_cpu(req->cqe.result),
+                                     le32_to_cpu(req->cqe.dw1), req->status);
         ret = pci_dma_write(PCI_DEVICE(n), addr, (void *)&req->cqe,
                             sizeof(req->cqe));
         if (ret) {
