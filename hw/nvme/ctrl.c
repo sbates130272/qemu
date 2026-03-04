@@ -1419,7 +1419,7 @@ static uint16_t nvme_map_mdata(NvmeCtrl *n, uint32_t nlb, NvmeRequest *req)
 static uint16_t nvme_tx_interleaved(NvmeCtrl *n, NvmeSg *sg, uint8_t *ptr,
                                     uint32_t len, uint32_t bytes,
                                     int32_t skip_bytes, int64_t offset,
-                                    NvmeTxDirection dir)
+                                    NvmeTxDirection dir, NvmeRequest *req)
 {
     hwaddr addr;
     uint32_t trans_len, count = bytes;
@@ -1455,8 +1455,16 @@ static uint16_t nvme_tx_interleaved(NvmeCtrl *n, NvmeSg *sg, uint8_t *ptr,
         }
 
         if (dir == NVME_TX_DIRECTION_TO_DEVICE) {
+            if (req && dma) {
+                trace_pci_nvme_io_dma_read(nvme_cid(req), nvme_sqid(req),
+                                           addr, trans_len);
+            }
             ret = nvme_addr_read(n, addr, ptr, trans_len);
         } else {
+            if (req && dma) {
+                trace_pci_nvme_io_dma_write(nvme_cid(req), nvme_sqid(req),
+                                            addr, trans_len);
+            }
             ret = nvme_addr_write(n, addr, ptr, trans_len);
         }
 
@@ -1519,10 +1527,20 @@ static inline uint16_t nvme_c2h(NvmeCtrl *n, void *ptr, uint32_t len,
                                 NvmeRequest *req)
 {
     uint16_t status;
+    int i;
 
     status = nvme_map_dptr(n, &req->sg, len, &req->cmd);
     if (status) {
         return status;
+    }
+
+    /* Trace DMA read operations for each scatter-gather segment */
+    if (req->sg.flags & NVME_SG_DMA) {
+        for (i = 0; i < req->sg.qsg.nsg; i++) {
+            trace_pci_nvme_io_dma_read(nvme_cid(req), nvme_sqid(req),
+                                       req->sg.qsg.sg[i].base,
+                                       req->sg.qsg.sg[i].len);
+        }
     }
 
     return nvme_tx(n, &req->sg, ptr, len, NVME_TX_DIRECTION_FROM_DEVICE);
@@ -1532,10 +1550,20 @@ static inline uint16_t nvme_h2c(NvmeCtrl *n, void *ptr, uint32_t len,
                                 NvmeRequest *req)
 {
     uint16_t status;
+    int i;
 
     status = nvme_map_dptr(n, &req->sg, len, &req->cmd);
     if (status) {
         return status;
+    }
+
+    /* Trace DMA write operations for each scatter-gather segment */
+    if (req->sg.flags & NVME_SG_DMA) {
+        for (i = 0; i < req->sg.qsg.nsg; i++) {
+            trace_pci_nvme_io_dma_write(nvme_cid(req), nvme_sqid(req),
+                                        req->sg.qsg.sg[i].base,
+                                        req->sg.qsg.sg[i].len);
+        }
     }
 
     return nvme_tx(n, &req->sg, ptr, len, NVME_TX_DIRECTION_TO_DEVICE);
@@ -1552,7 +1580,7 @@ uint16_t nvme_bounce_data(NvmeCtrl *n, void *ptr, uint32_t len,
     if (nvme_ns_ext(ns) &&
         !(pi && pract && ns->lbaf.ms == nvme_pi_tuple_size(ns))) {
         return nvme_tx_interleaved(n, &req->sg, ptr, len, ns->lbasz,
-                                   ns->lbaf.ms, 0, dir);
+                                   ns->lbaf.ms, 0, dir, req);
     }
 
     return nvme_tx(n, &req->sg, ptr, len, dir);
@@ -1566,7 +1594,7 @@ uint16_t nvme_bounce_mdata(NvmeCtrl *n, void *ptr, uint32_t len,
 
     if (nvme_ns_ext(ns)) {
         return nvme_tx_interleaved(n, &req->sg, ptr, len, ns->lbaf.ms,
-                                   ns->lbasz, ns->lbasz, dir);
+                                   ns->lbasz, ns->lbasz, dir, req);
     }
 
     nvme_sg_unmap(&req->sg);
@@ -1583,7 +1611,18 @@ static inline void nvme_blk_read(BlockBackend *blk, int64_t offset,
                                  uint32_t align, BlockCompletionFunc *cb,
                                  NvmeRequest *req)
 {
+    int i;
+
     assert(req->sg.flags & NVME_SG_ALLOC);
+
+    /* Trace DMA read operations for each scatter-gather segment */
+    if (req->sg.flags & NVME_SG_DMA) {
+        for (i = 0; i < req->sg.qsg.nsg; i++) {
+            trace_pci_nvme_io_dma_read(nvme_cid(req), nvme_sqid(req),
+                                       req->sg.qsg.sg[i].base,
+                                       req->sg.qsg.sg[i].len);
+        }
+    }
 
     if (req->sg.flags & NVME_SG_DMA) {
         req->aiocb = dma_blk_read(blk, &req->sg.qsg, offset, align, cb, req);
@@ -1596,7 +1635,18 @@ static inline void nvme_blk_write(BlockBackend *blk, int64_t offset,
                                   uint32_t align, BlockCompletionFunc *cb,
                                   NvmeRequest *req)
 {
+    int i;
+
     assert(req->sg.flags & NVME_SG_ALLOC);
+
+    /* Trace DMA write operations for each scatter-gather segment */
+    if (req->sg.flags & NVME_SG_DMA) {
+        for (i = 0; i < req->sg.qsg.nsg; i++) {
+            trace_pci_nvme_io_dma_write(nvme_cid(req), nvme_sqid(req),
+                                        req->sg.qsg.sg[i].base,
+                                        req->sg.qsg.sg[i].len);
+        }
+    }
 
     if (req->sg.flags & NVME_SG_DMA) {
         req->aiocb = dma_blk_write(blk, &req->sg.qsg, offset, align, cb, req);
