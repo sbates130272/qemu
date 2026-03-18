@@ -205,6 +205,7 @@ typedef struct NvmeNamespaceParams {
     uint8_t  pi;
     uint8_t  pil;
     uint8_t  pif;
+    uint8_t  lbaf_mask;
 
     uint16_t mssrl;
     uint32_t mcl;
