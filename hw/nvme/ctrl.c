@@ -9465,6 +9465,7 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
     if (n->namespace.blkconf.blk) {
         ns = &n->namespace;
         ns->params.nsid = 1;
+        ns->params.lbaf_mask = 0xFF;
         ns->ctrl = n;
 
         if (nvme_ns_setup(ns, errp)) {

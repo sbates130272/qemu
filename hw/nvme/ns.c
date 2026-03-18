@@ -125,9 +125,22 @@ static int nvme_ns_init(NvmeNamespace *ns, Error **errp)
         [7] = { .ds = 12, .ms = 64 },
     };
 
-    ns->nlbaf = 8;
+    if (!ns->params.lbaf_mask) {
+        error_setg(errp,
+                   "lbaf-mask must enable at least one format");
+        return -1;
+    }
 
-    memcpy(&id_ns->lbaf, &defaults, sizeof(defaults));
+    int nlbaf = 0;
+
+    for (i = 0; i < 8; i++) {
+        if (ns->params.lbaf_mask & (1 << i)) {
+            id_ns->lbaf[nlbaf] = defaults[i];
+            nlbaf++;
+        }
+    }
+
+    ns->nlbaf = nlbaf;
 
     for (i = 0; i < ns->nlbaf; i++) {
         if (id_ns->lbaf[i].ms >= 16) {
@@ -899,6 +912,8 @@ static const Property nvme_ns_props[] = {
     DEFINE_PROP_UINT8("pi", NvmeNamespace, params.pi, 0),
     DEFINE_PROP_UINT8("pil", NvmeNamespace, params.pil, 0),
     DEFINE_PROP_UINT8("pif", NvmeNamespace, params.pif, 0),
+    DEFINE_PROP_UINT8("lbaf-mask", NvmeNamespace,
+                      params.lbaf_mask, 0xFF),
     DEFINE_PROP_UINT16("mssrl", NvmeNamespace, params.mssrl, 128),
     DEFINE_PROP_UINT32("mcl", NvmeNamespace, params.mcl, 128),
     DEFINE_PROP_UINT8("msrc", NvmeNamespace, params.msrc, 127),
