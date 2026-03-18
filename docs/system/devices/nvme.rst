@@ -261,6 +261,31 @@ include ranges (i.e. ``0;8-15``). If no reclaim unit handle list is specified,
 the controller will assign the controller-specified reclaim unit handle to
 placement handle identifier 0.
 
+LBA Format Filtering
+--------------------
+
+By default, the virtual namespace device advertises eight LBA formats
+(LBAF 0--7) to the guest: four with 512-byte data size (``ds=9``) and
+four with 4 KiB data size (``ds=12``), each with varying metadata
+sizes (0, 8, 16 and 64 bytes).
+
+``lbaf-mask=UINT8`` (default: ``0xFF``)
+  A bitmask that controls which of the eight default LBA formats are
+  advertised to the guest. Bit *N* corresponds to default table entry
+  *N*. Clearing a bit removes that format from the namespace's
+  ``id_ns.lbaf`` array; the remaining entries are compacted so their
+  indices are contiguous. At least one bit must be set.
+
+  The default value ``0xFF`` (255) advertises all eight formats,
+  preserving the existing behavior. For example, setting
+  ``lbaf-mask=0x11`` advertises only LBAF 0 (512 B, no metadata) and
+  LBAF 4 (4 KiB, no metadata).
+
+  If the namespace's active logical block size and metadata
+  configuration do not match any of the enabled formats, a
+  non-standard format entry is appended automatically (the same
+  fallback that applies without filtering).
+
 Metadata
 --------
 
