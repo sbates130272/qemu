@@ -321,6 +321,152 @@ static void test_pci_read_command(void)
     qtest_quit(qts);
 }
 
+/*
+ * Raw PCI config space accessors with explicit bus number.
+ *
+ * The qtest QPCIBus helpers hard-code bus 0. These use the x86 CF8/CFC
+ * mechanism directly, encoding the bus number in the address word so we
+ * can reach devices behind root ports on secondary buses.
+ */
+static uint32_t raw_pci_cfg_addr(uint8_t bus, uint8_t devfn, uint8_t off)
+{
+    return (1U << 31) | ((uint32_t)bus << 16) |
+           ((uint32_t)devfn << 8) | (off & 0xFC);
+}
+
+static uint16_t raw_pci_config_readw(QTestState *qts,
+                                     uint8_t bus, uint8_t devfn, uint8_t off)
+{
+    qtest_outl(qts, 0xcf8, raw_pci_cfg_addr(bus, devfn, off));
+    return qtest_inw(qts, 0xcfc + (off & 2));
+}
+
+static void raw_pci_config_writew(QTestState *qts,
+                                  uint8_t bus, uint8_t devfn,
+                                  uint8_t off, uint16_t val)
+{
+    qtest_outl(qts, 0xcf8, raw_pci_cfg_addr(bus, devfn, off));
+    qtest_outw(qts, 0xcfc + (off & 2), val);
+}
+
+static uint32_t raw_pci_config_readl(QTestState *qts,
+                                     uint8_t bus, uint8_t devfn, uint8_t off)
+{
+    qtest_outl(qts, 0xcf8, raw_pci_cfg_addr(bus, devfn, off));
+    return qtest_inl(qts, 0xcfc);
+}
+
+static void raw_pci_config_writel(QTestState *qts,
+                                  uint8_t bus, uint8_t devfn,
+                                  uint8_t off, uint32_t val)
+{
+    qtest_outl(qts, 0xcf8, raw_pci_cfg_addr(bus, devfn, off));
+    qtest_outl(qts, 0xcfc, val);
+}
+
+/* Test: Write command targeting a device on a secondary (non-zero) PCI bus */
+static void test_pci_write_command_secondary_bus(void)
+{
+    QTestState *qts;
+    QPCIBus *pcibus;
+    QPCIDevice *bridge_dev, *rp_dev;
+    uint64_t shadow_gpa;
+    struct pci_mmio_bridge_command cmd = {0};
+    struct pci_mmio_bridge_ring_meta meta;
+    uint16_t target_bdf, vid;
+    const uint8_t sec_bus = 1;
+    const uint8_t testdev_devfn = 0;
+    const uint32_t bar_addr = 0xF0000000;
+
+    qts = qtest_init("-machine q35 "
+                     "-device pci-mmio-bridge,id=bridge0 "
+                     "-device pcie-root-port,id=rp0,bus=pcie.0,"
+                     "addr=4.0,chassis=1 "
+                     "-device pci-testdev,id=testdev0,bus=rp0");
+
+    pcibus = qpci_new_pc(qts, NULL);
+
+    bridge_dev = find_pci_mmio_bridge(pcibus);
+    g_assert_nonnull(bridge_dev);
+    qpci_device_enable(bridge_dev);
+    shadow_gpa = read_shadow_gpa(bridge_dev);
+
+    /*
+     * Program the root port (bus 0, devfn 0x20 = device 4) so that
+     * its secondary bus number is assigned and its memory window is
+     * open.  Without firmware, qtest must do this manually.
+     */
+    rp_dev = qpci_device_find(pcibus, QPCI_DEVFN(4, 0));
+    g_assert_nonnull(rp_dev);
+
+    qpci_config_writeb(rp_dev, PCI_PRIMARY_BUS, 0);
+    qpci_config_writeb(rp_dev, PCI_SECONDARY_BUS, sec_bus);
+    qpci_config_writeb(rp_dev, PCI_SUBORDINATE_BUS, sec_bus);
+
+    /* Memory window: 0xF000_0000 – 0xF00F_FFFF (1 MB) */
+    qpci_config_writew(rp_dev, PCI_MEMORY_BASE,
+                       (bar_addr >> 16) & 0xFFF0);
+    qpci_config_writew(rp_dev, PCI_MEMORY_LIMIT,
+                       (bar_addr >> 16) & 0xFFF0);
+
+    /* Enable memory space + bus master on the root port */
+    qpci_config_writew(rp_dev, PCI_COMMAND,
+                       PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+
+    /*
+     * Now we can reach the pci-testdev on bus 1 via CF8/CFC with the
+     * bus number encoded in the config address.
+     */
+    vid = raw_pci_config_readw(qts, sec_bus, testdev_devfn, PCI_VENDOR_ID);
+    if (vid == 0xFFFF) {
+        g_test_skip("pci-testdev not visible on secondary bus");
+        g_free(bridge_dev);
+        g_free(rp_dev);
+        qpci_free_pc(pcibus);
+        qtest_quit(qts);
+        return;
+    }
+
+    /* Assign BAR 0 and enable memory decoding on the test device */
+    raw_pci_config_writel(qts, sec_bus, testdev_devfn,
+                          PCI_BASE_ADDRESS_0, bar_addr);
+    raw_pci_config_writew(qts, sec_bus, testdev_devfn,
+                          PCI_COMMAND,
+                          PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+
+    /* Confirm BAR was programmed */
+    g_assert_cmphex(raw_pci_config_readl(qts, sec_bus, testdev_devfn,
+                                         PCI_BASE_ADDRESS_0) & ~0xF,
+                    ==, bar_addr);
+
+    target_bdf = ((uint16_t)sec_bus << 8) | testdev_devfn;
+
+    /* Write command targeting the secondary-bus device */
+    cmd.target_bdf = target_bdf;
+    cmd.target_bar = 0;
+    cmd.offset = 0;
+    cmd.value = 0xBEEFCAFE;
+    cmd.command = PCI_MMIO_BRIDGE_CMD_WRITE;
+    cmd.size = 4;
+    cmd.status = PCI_MMIO_BRIDGE_STATUS_PENDING;
+    cmd.sequence = 1;
+
+    qtest_memwrite(qts, shadow_gpa + sizeof(meta), &cmd, sizeof(cmd));
+
+    meta.producer_idx = 1;
+    qtest_memwrite(qts, shadow_gpa, &meta.producer_idx, 4);
+
+    qtest_clock_step(qts, 10000000);
+
+    qtest_memread(qts, shadow_gpa + sizeof(meta), &cmd, sizeof(cmd));
+    g_assert_cmpuint(cmd.status, ==, PCI_MMIO_BRIDGE_STATUS_COMPLETE);
+
+    g_free(bridge_dev);
+    g_free(rp_dev);
+    qpci_free_pc(pcibus);
+    qtest_quit(qts);
+}
+
 /* Test: Device reset clears statistics */
 static void test_pci_device_reset(void)
 {
@@ -407,6 +553,8 @@ int main(int argc, char **argv)
                    test_pci_write_command);
     qtest_add_func("/pci-mmio-bridge-pci/read-command",
                    test_pci_read_command);
+    qtest_add_func("/pci-mmio-bridge-pci/write-command-secondary-bus",
+                   test_pci_write_command_secondary_bus);
     qtest_add_func("/pci-mmio-bridge-pci/device-reset",
                    test_pci_device_reset);
     qtest_add_func("/pci-mmio-bridge-pci/multiple-bridges",
