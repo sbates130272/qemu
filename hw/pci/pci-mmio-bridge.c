@@ -16,7 +16,6 @@
 #include "hw/pci/pci_bus.h"
 #include "system/address-spaces.h"
 #include "qemu/timer.h"
-#include "qemu/log.h"
 #include "qapi/error.h"
 #include "trace.h"
 #include "hw/core/qdev-properties.h"
@@ -56,15 +55,7 @@ static PCIDevice *pci_mmio_bridge_find_device(PCIMMIOBridge *bridge,
         return NULL;
     }
 
-    /* For now, only support bus 0 (main PCI bus) */
-    if (bus_num != 0) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "pci-mmio-bridge: Multi-bus not yet supported (BDF %04x)\n",
-                      bdf);
-        return NULL;
-    }
-
-    dev = bridge->pci_bus->devices[devfn];
+    dev = pci_find_device(bridge->pci_bus, bus_num, devfn);
     if (!dev) {
         trace_pci_mmio_bridge_device_not_found(bdf);
     }
@@ -246,7 +237,7 @@ reschedule:
     /* Reschedule for next poll cycle */
     if (bridge->poll_timer) {
         timer_mod(bridge->poll_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   bridge->poll_interval_ns);
     }
 }
@@ -318,13 +309,13 @@ PCIMMIOBridge *pci_mmio_bridge_init(PCIBus *pci_bus,
     bridge->poll_bh = qemu_bh_new(pci_mmio_bridge_poll, bridge);
 
     /* Also create timer for periodic polling when BH isn't triggered */
-    bridge->poll_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+    bridge->poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                       pci_mmio_bridge_poll, bridge);
     bridge->enabled = true;
 
     /* Start periodic polling */
     timer_mod(bridge->poll_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               bridge->poll_interval_ns);
 
     trace_pci_mmio_bridge_init(gpa, size, bridge->queue_depth,
