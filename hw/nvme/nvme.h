@@ -624,6 +624,14 @@ typedef struct NvmeCtrl {
         hwaddr            cba;
     } pmr;
 
+    /*
+     * Optional VFIO passthrough device whose BAR is the source/sink for
+     * P2P DMA (e.g. a GPU's VRAM aperture). Resolved from the "vram-dev"
+     * link property; "vram-bar" selects which BAR.
+     */
+    PCIDevice *vram_dev;
+    uint8_t    vram_bar;
+
     uint8_t     aer_mask;
     NvmeRequest **aer_reqs;
     QTAILQ_HEAD(, NvmeAsyncEvent) aer_queue;

@@ -9530,6 +9530,9 @@ static void nvme_exit(PCIDevice *pci_dev)
 
 static const Property nvme_props[] = {
     DEFINE_BLOCK_PROPERTIES(NvmeCtrl, namespace.blkconf),
+    DEFINE_PROP_LINK("vram-dev", NvmeCtrl, vram_dev, TYPE_PCI_DEVICE,
+                     PCIDevice *),
+    DEFINE_PROP_UINT8("vram-bar", NvmeCtrl, vram_bar, 0),
     DEFINE_PROP_LINK("pmrdev", NvmeCtrl, pmr.dev, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
     DEFINE_PROP_LINK("subsys", NvmeCtrl, subsys, TYPE_NVME_SUBSYS,
