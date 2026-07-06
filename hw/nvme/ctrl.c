@@ -827,27 +827,20 @@ static uint16_t nvme_map_addr_pmr(NvmeCtrl *n, QEMUIOVector *iov, hwaddr addr,
     return NVME_SUCCESS;
 }
 
-/*
- * GPU VRAM P2P DMA support for emulated NVMe
- *
- * Detects if a guest physical address falls within a VFIO passthrough
- * GPU's VRAM BAR range. This allows the emulated NVMe controller to
- * perform DMA directly from GPU VRAM for peer-to-peer transfers.
- *
- * Note: This range detection is a proof-of-concept. A production
- * implementation should discover VFIO device BARs dynamically or
- * use device properties to configure the range.
- */
-static inline bool nvme_addr_is_vram(hwaddr addr, hwaddr len)
+static inline bool nvme_addr_is_vram(NvmeCtrl *n, hwaddr addr, hwaddr len)
 {
-    hwaddr hi = addr + len - 1;
-    
-    /*
-     * Typical AMD GPU VRAM BAR range in guest physical address space.
-     * This matches a 16GB BAR starting at 0xc400000000.
-     * TODO: Make this configurable via device property.
-     */
-    return (addr >= 0xc400000000ULL && hi < 0xc800000000ULL);
+    PCIDevice *dev = n->vram_dev;
+    hwaddr base, size;
+
+    if (!dev) {
+        return false;
+    }
+    base = pci_get_bar_addr(dev, n->vram_bar);
+    size = dev->io_regions[n->vram_bar].size;
+    if (!base || !size) {
+        return false;
+    }
+    return addr >= base && (addr + len) <= (base + size);
 }
 
 /*
@@ -932,7 +925,7 @@ static uint16_t nvme_map_addr(NvmeCtrl *n, NvmeSg *sg, hwaddr addr, size_t len)
         cmb = true;
     } else if (nvme_addr_is_pmr(n, addr)) {
         pmr = true;
-    } else if (nvme_addr_is_vram(addr, len)) {
+    } else if (nvme_addr_is_vram(n, addr, len)) {
         vram = true;
     }
 
@@ -989,7 +982,7 @@ static inline bool nvme_addr_is_dma(NvmeCtrl *n, hwaddr addr)
 {
     /* VRAM, CMB, and PMR are not DMA - they use direct memory mapping */
     return !(nvme_addr_is_cmb(n, addr) || nvme_addr_is_pmr(n, addr) ||
-             nvme_addr_is_vram(addr, 1));
+             nvme_addr_is_vram(n, addr, 1));
 }
 
 static uint16_t nvme_map_prp(NvmeCtrl *n, NvmeSg *sg, uint64_t prp1,
