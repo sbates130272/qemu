@@ -685,6 +685,10 @@ typedef struct NvmeCtrl {
 
     /* Migration-related stuff */
     Error *migration_blocker;
+
+    /* VFIO passthrough device whose BAR is the VRAM aperture for P2P DMA */
+    PCIDevice *vram_dev;
+    uint8_t    vram_bar;
 } NvmeCtrl;
 
 typedef enum NvmeResetType {
