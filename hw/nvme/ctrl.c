@@ -9572,6 +9572,9 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
     DEFINE_PROP_UINT16("atomic.awupf", NvmeCtrl, params.atomic_awupf, 0),
     DEFINE_PROP_BOOL("ocp", NvmeCtrl, params.ocp, false),
+    DEFINE_PROP_LINK("vram-dev", NvmeCtrl, vram_dev, TYPE_PCI_DEVICE,
+                     PCIDevice *),
+    DEFINE_PROP_UINT8("vram-bar", NvmeCtrl, vram_bar, 0),
 };
 
 static void nvme_get_smart_warning(Object *obj, Visitor *v, const char *name,

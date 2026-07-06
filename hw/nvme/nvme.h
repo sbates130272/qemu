@@ -667,6 +667,10 @@ typedef struct NvmeCtrl {
 
     /* Socket mapping to SPDM over NVMe Security In/Out commands */
     int spdm_socket;
+
+    /* VFIO passthrough device whose BAR is the VRAM aperture for P2P DMA */
+    PCIDevice *vram_dev;
+    uint8_t    vram_bar;
 } NvmeCtrl;
 
 typedef enum NvmeResetType {
