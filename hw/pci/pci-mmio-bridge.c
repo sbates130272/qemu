@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/memalign.h"
+#include "qemu/memfd.h"
 #include "qemu/main-loop.h"
 #include "hw/pci/pci-mmio-bridge.h"
 #include "hw/pci/pci.h"
@@ -280,8 +281,19 @@ PCIMMIOBridge *pci_mmio_bridge_init(PCIBus *pci_bus,
 
     /* Allocate guest RAM for shadow buffer with unique name */
     char *mr_name = g_strdup_printf("pci-mmio-bridge-shadow@0x%"PRIx64, gpa);
-    memory_region_init_ram(&bridge->shadow_mr, NULL, mr_name, size,
-                           &error_fatal);
+    int fd = qemu_memfd_create(mr_name, size, false, 0, 0, errp);
+    if (fd < 0) {
+        g_free(mr_name);
+        g_free(bridge);
+        return NULL;
+    }
+    if (!memory_region_init_ram_from_fd(&bridge->shadow_mr, NULL, mr_name,
+                                        size, RAM_SHARED, fd, 0, errp)) {
+        close(fd);
+        g_free(mr_name);
+        g_free(bridge);
+        return NULL;
+    }
     g_free(mr_name);
 
     /* Add to system memory at specified GPA */
@@ -347,9 +359,6 @@ void pci_mmio_bridge_cleanup(PCIMMIOBridge *bridge)
     /* Remove from system memory and cleanup */
     memory_region_del_subregion(get_system_memory(), &bridge->shadow_mr);
     object_unparent(OBJECT(&bridge->shadow_mr));
-
-    /* Free backing memory */
-    qemu_vfree(bridge->shadow_hva);
 
     g_free(bridge);
 }
