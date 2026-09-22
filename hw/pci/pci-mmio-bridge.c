@@ -238,7 +238,7 @@ reschedule:
     /* Reschedule for next poll cycle */
     if (bridge->poll_timer) {
         timer_mod(bridge->poll_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  qemu_clock_get_ns(QEMU_CLOCK_HOST) +
                   bridge->poll_interval_ns);
     }
 }
@@ -321,13 +321,13 @@ PCIMMIOBridge *pci_mmio_bridge_init(PCIBus *pci_bus,
     bridge->poll_bh = qemu_bh_new(pci_mmio_bridge_poll, bridge);
 
     /* Also create timer for periodic polling when BH isn't triggered */
-    bridge->poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+    bridge->poll_timer = timer_new_ns(QEMU_CLOCK_HOST,
                                       pci_mmio_bridge_poll, bridge);
     bridge->enabled = true;
 
     /* Start periodic polling */
     timer_mod(bridge->poll_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              qemu_clock_get_ns(QEMU_CLOCK_HOST) +
               bridge->poll_interval_ns);
 
     trace_pci_mmio_bridge_init(gpa, size, bridge->queue_depth,
