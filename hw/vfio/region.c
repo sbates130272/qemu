@@ -295,6 +295,23 @@ static bool vfio_region_create_dma_buf(VFIORegion *region, Error **errp)
 
     /* Check if backend supports DMA-BUF creation */
     if (!(vbasedev->io_ops->capabilities & VFIO_IO_CAP_DMA_BUF)) {
+        /*
+         * vfio-user: the region fd arrives from GET_REGION_INFO and is held
+         * in region_fds[].  Assign a dup'd copy to each mmap RAMBlock so
+         * memory_region_get_fd() returns non-(-1) and vfio_user_dma_map
+         * sends the fd+offset in DMA_MAP, enabling peer P2P DMA.
+         * fd_offset must include region->fd_offset so the DMA_MAP offset
+         * is absolute within the fd, not relative to the mmap window.
+         */
+        int region_fd = vfio_device_get_region_fd(vbasedev, region->nr);
+        if (region_fd != -1) {
+            for (i = 0; i < region->nr_mmaps; i++) {
+                RAMBlock *ram_block = region->mmaps[i].mem.ram_block;
+                ram_block->fd = dup(region_fd);
+                ram_block->fd_offset = region->fd_offset +
+                                       region->mmaps[i].offset;
+            }
+        }
         return true;
     }
 
