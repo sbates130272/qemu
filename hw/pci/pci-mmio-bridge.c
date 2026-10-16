@@ -23,6 +23,7 @@
 #include "hw/core/resettable.h"
 #include "qemu/module.h"
 #include "exec/target_page.h"
+#include "hw/i386/e820_memory_layout.h"
 
 /* Default polling interval: 1ms */
 #define DEFAULT_POLL_INTERVAL_NS (1000 * 1000)
@@ -191,11 +192,16 @@ void pci_mmio_bridge_poll(void *opaque)
     bridge->total_polls++;
 
     /*
-     * Read metadata from guest memory using address_space_read. This ensures
-     * we see any VFIO device writes and not cached copies.
+     * Use the guest-provided override GPA when set (non-zero); fall back to
+     * the default shadow GPA.  The override is written by the guest driver
+     * when it allocates the ring from hipHostMalloc (flat GPU aperture) so
+     * the GPU kernel can write to it and QEMU can read the same pages.
      */
+    hwaddr poll_gpa = bridge->override_gpa ? bridge->override_gpa
+                                           : bridge->shadow_gpa;
+
     struct pci_mmio_bridge_ring_meta metadata;
-    address_space_read(&address_space_memory, bridge->shadow_gpa,
+    address_space_read(&address_space_memory, poll_gpa,
                        MEMTXATTRS_UNSPECIFIED, &metadata, sizeof(metadata));
 
     producer_idx = metadata.producer_idx;
@@ -204,7 +210,7 @@ void pci_mmio_bridge_poll(void *opaque)
     /* Process all pending commands */
     while (consumer_idx != producer_idx) {
         uint32_t slot = consumer_idx % bridge->queue_depth;
-        hwaddr cmd_addr = bridge->shadow_gpa +
+        hwaddr cmd_addr = poll_gpa +
                           sizeof(struct pci_mmio_bridge_ring_meta) +
                           (slot * sizeof(struct pci_mmio_bridge_command));
 
@@ -458,6 +464,16 @@ static void pci_mmio_bridge_pci_realize(PCIDevice *pci_dev, Error **errp)
 
     s->bridge->enabled = s->enabled;
 
+    /*
+     * Add an E820 reservation so the guest OS does not allocate from the
+     * shadow buffer pages.  Without this the kernel treats the shadow GPA
+     * as normal System RAM, allocates physical pages there, and hipHostRegister
+     * on those pages corrupts kernel data when the bridge overlay replaces them
+     * in the KVM EPT.  The reservation must be established before SeaBIOS
+     * builds the E820 table that the guest kernel reads at boot.
+     */
+    e820_add_entry(s->shadow_gpa, s->shadow_size, E820_RESERVED);
+
     /* Expose shadow buffer GPA and size via vendor-specific config space */
     pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET +
                  PCI_MMIO_BRIDGE_CAP_GPA_LO,
@@ -472,8 +488,45 @@ static void pci_mmio_bridge_pci_realize(PCIDevice *pci_dev, Error **errp)
                  PCI_MMIO_BRIDGE_CAP_DEPTH,
                  s->bridge->queue_depth);
 
+    /* Mark override-GPA registers (0x50-0x57) writable in wmask */
+    pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET +
+                 PCI_MMIO_BRIDGE_CAP_OVERRIDE_LO, 0);
+    pci_set_long(pci_conf + PCI_MMIO_BRIDGE_CAP_OFFSET +
+                 PCI_MMIO_BRIDGE_CAP_OVERRIDE_HI, 0);
+    memset(pci_dev->wmask + PCI_MMIO_BRIDGE_CAP_OFFSET +
+           PCI_MMIO_BRIDGE_CAP_OVERRIDE_LO, 0xFF, 8);
+
     trace_pci_mmio_bridge_realize(s->shadow_gpa, s->shadow_size,
                                       s->bridge->queue_depth);
+}
+
+static void pci_mmio_bridge_config_write(PCIDevice *pci_dev, uint32_t addr,
+                                          uint32_t val, int len)
+{
+    PCIMMIOBridge_NEW *s = PCI_MMIO_BRIDGE(pci_dev);
+
+    pci_default_write_config(pci_dev, addr, val, len);
+
+    /* Check if the guest wrote to the override-GPA registers */
+    uint32_t override_lo_off = PCI_MMIO_BRIDGE_CAP_OFFSET +
+                               PCI_MMIO_BRIDGE_CAP_OVERRIDE_LO;
+    uint32_t override_hi_off = PCI_MMIO_BRIDGE_CAP_OFFSET +
+                               PCI_MMIO_BRIDGE_CAP_OVERRIDE_HI;
+
+    if ((addr <= override_lo_off && addr + len > override_lo_off) ||
+        (addr <= override_hi_off && addr + len > override_hi_off)) {
+        uint64_t lo = pci_get_long(pci_dev->config + override_lo_off);
+        uint64_t hi = pci_get_long(pci_dev->config + override_hi_off);
+        hwaddr new_gpa = (hi << 32) | lo;
+        if (s->bridge) {
+            s->bridge->override_gpa = new_gpa;
+            /* Reset head so we consume from the beginning of the new ring */
+            s->bridge->head = 0;
+            fprintf(stderr,
+                    "pci_mmio_bridge: guest override poll GPA=0x%" HWADDR_PRIx
+                    "\n", new_gpa);
+        }
+    }
 }
 
 static void pci_mmio_bridge_pci_exit(PCIDevice *pci_dev)
@@ -537,6 +590,7 @@ static void pci_mmio_bridge_pci_class_init(ObjectClass *klass,
 
     k->realize = pci_mmio_bridge_pci_realize;
     k->exit = pci_mmio_bridge_pci_exit;
+    k->config_write = pci_mmio_bridge_config_write;
     k->vendor_id = PCI_VENDOR_ID_REDHAT;
     k->device_id = PCI_DEVICE_ID_REDHAT_MMIO_BRIDGE;
     k->class_id = PCI_CLASS_SYSTEM_OTHER;

@@ -80,6 +80,9 @@ typedef struct PCIMMIOBridge {
     uint64_t total_reads;
     uint64_t total_errors;
     uint64_t total_polls;
+
+    /* Guest-provided override GPA for the command ring (0 = use shadow_gpa) */
+    hwaddr override_gpa;
 } PCIMMIOBridge;
 
 /*
@@ -143,6 +146,8 @@ void pci_mmio_bridge_poll(void *opaque);
 #define PCI_MMIO_BRIDGE_CAP_GPA_HI  0x04  /* Upper 32 bits of GPA */
 #define PCI_MMIO_BRIDGE_CAP_SIZE    0x08  /* Buffer size */
 #define PCI_MMIO_BRIDGE_CAP_DEPTH   0x0C  /* Queue depth */
+#define PCI_MMIO_BRIDGE_CAP_OVERRIDE_LO  0x10  /* Lower 32 bits of override GPA */
+#define PCI_MMIO_BRIDGE_CAP_OVERRIDE_HI  0x14  /* Upper 32 bits of override GPA */
 
 #define TYPE_PCI_MMIO_BRIDGE "pci-mmio-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(PCIMMIOBridge_NEW, PCI_MMIO_BRIDGE)
