@@ -23,6 +23,8 @@
 #include "hw/core/resettable.h"
 #include "qemu/module.h"
 #include "exec/target_page.h"
+#include "exec/memop.h"
+#include "system/memory.h"
 #include "hw/i386/e820_memory_layout.h"
 
 /* Default polling interval: 1ms */
@@ -123,15 +125,37 @@ static void pci_mmio_bridge_execute_command(
         return;
     }
 
-    /* Calculate full MMIO address (BAR base + offset) */
-    hwaddr mmio_addr = bar_addr + cmd->offset;
+    /*
+     * Access the BAR's MemoryRegion directly rather than via
+     * address_space_write(&address_space_memory, bar_addr+offset).
+     * For vfio-user devices the 64-bit BAR GPA may not be registered in
+     * address_space_memory, causing address_space_write to silently write to
+     * unassigned memory and return MEMTX_OK.  Use memory_region_find() to
+     * locate the exact leaf MemoryRegion at cmd->offset within the BAR, then
+     * dispatch directly to it.  For vfio-user the leaf is the IO-ops region
+     * whose write callback sends a REGION_WRITE message to the server.
+     */
+    PCIIORegion *io_region = &target->io_regions[cmd->target_bar];
+    MemoryRegion *bar_mr = io_region->memory;
 
-    /* Execute the operation using address_space to access MMIO space */
+    /* Execute the operation using the BAR MemoryRegion directly */
     switch (cmd->command) {
     case PCI_MMIO_BRIDGE_CMD_WRITE:
-        result = address_space_write(&address_space_memory, mmio_addr,
-                                      MEMTXATTRS_UNSPECIFIED,
-                                      &cmd->value, cmd->size);
+        if (bar_mr) {
+            MemoryRegionSection sec = memory_region_find(bar_mr, cmd->offset,
+                                                         cmd->size);
+            if (sec.mr) {
+                result = memory_region_dispatch_write(
+                    sec.mr, sec.offset_within_region,
+                    cmd->value, size_memop(cmd->size) | MO_LE,
+                    MEMTXATTRS_UNSPECIFIED);
+                memory_region_unref(sec.mr);
+            } else {
+                result = MEMTX_ERROR;
+            }
+        } else {
+            result = MEMTX_ERROR;
+        }
         if (result == MEMTX_OK) {
             qatomic_set(&cmd->status, PCI_MMIO_BRIDGE_STATUS_COMPLETE);
             smp_wmb();  /* Ensure status visible to guest */
@@ -147,7 +171,8 @@ static void pci_mmio_bridge_execute_command(
         }
         break;
 
-    case PCI_MMIO_BRIDGE_CMD_READ:
+    case PCI_MMIO_BRIDGE_CMD_READ: {
+        hwaddr mmio_addr = bar_addr + cmd->offset;
         result = address_space_read(&address_space_memory, mmio_addr,
                                      MEMTXATTRS_UNSPECIFIED,
                                      &value, cmd->size);
@@ -166,6 +191,10 @@ static void pci_mmio_bridge_execute_command(
             trace_pci_mmio_bridge_read_failed(cmd->target_bdf, cmd->target_bar,
                                               cmd->offset, result);
         }
+        break;
+    }
+
+    default:
         break;
     }
 
@@ -513,8 +542,7 @@ static void pci_mmio_bridge_config_write(PCIDevice *pci_dev, uint32_t addr,
     uint32_t override_hi_off = PCI_MMIO_BRIDGE_CAP_OFFSET +
                                PCI_MMIO_BRIDGE_CAP_OVERRIDE_HI;
 
-    if ((addr <= override_lo_off && addr + len > override_lo_off) ||
-        (addr <= override_hi_off && addr + len > override_hi_off)) {
+    if (addr <= override_lo_off && addr + len > override_lo_off) {
         uint64_t lo = pci_get_long(pci_dev->config + override_lo_off);
         uint64_t hi = pci_get_long(pci_dev->config + override_hi_off);
         hwaddr new_gpa = (hi << 32) | lo;
