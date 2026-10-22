@@ -1444,7 +1444,7 @@ void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
                                 uint64_t datamatch, unsigned size)
 {
     VFIOUserDoorbell *db;
-    VFIOUserHostDoorbellFD *msg;
+    VFIOUserHostDoorbellFD *msg;  /* alias into db->msg */
     VFIOUserFDs *fds;
     Error *err = NULL;
 
@@ -1465,8 +1465,13 @@ void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
 
     QLIST_INSERT_HEAD(&proxy->doorbells, db, next);
 
-    /* Send VFIO_USER_HOST_DOORBELL_FD to the server */
-    msg = g_new0(VFIOUserHostDoorbellFD, 1);
+    /*
+     * Build the wire message in-place inside db->msg.  The buffer must stay
+     * alive until the async send completes, so we never free it separately —
+     * it is part of the VFIOUserDoorbell which is freed in
+     * vfio_user_disconnect().
+     */
+    msg = &db->msg;
     vfio_user_request_msg(&msg->hdr, VFIO_USER_HOST_DOORBELL_FD,
                           sizeof(*msg), VFIO_USER_NO_REPLY);
     msg->gpa       = gpa;
@@ -1483,5 +1488,4 @@ void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
         error_reportf_err(err, "vfio_user_send_doorbell_fd: ");
         /* doorbell remains registered locally even if send fails */
     }
-    g_free(msg);
 }
