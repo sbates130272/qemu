@@ -83,9 +83,12 @@ options exist:
 2. **Host doorbell eventfd** (``VFIO_USER_HOST_DOORBELL_FD``) — for
    fixed-value doorbell registers (see below).
 
-3. **DMA_WRITE with MMIO extension** — not yet implemented; would require
-   extending ``vfio_user_dma_write()`` to call ``address_space_write()``
-   instead of ``pci_dma_write()``.
+3. **DMA_WRITE with MMIO extension** — ``vfio_user_dma_write()`` now calls
+   ``address_space_write(&address_space_memory, ...)`` instead of
+   ``pci_dma_write()``, so ``DMA_WRITE`` messages whose GPA falls in MMIO space
+   are dispatched to IO-ops handlers.  The libvfio-user companion API
+   ``vfu_mmio_write()`` sends a ``VFIO_USER_DMA_WRITE`` message without
+   requiring the GPA to be registered in the server's DMA table (see below).
 
 Host MMIO Doorbell Eventfd
 --------------------------
@@ -147,6 +150,49 @@ Performance comparison
 | Peer memfd BAR              | 0 (memcpy)        | Target BAR is memfd-backed|
 +-----------------------------+-------------------+---------------------------+
 | **Host doorbell eventfd**   | 1 eventfd write   | Device uses               |
+|                             | (kernel-only)     | ``memory_region_add_      |
+|                             |                   | eventfd(..., true, ...)`` |
++-----------------------------+-------------------+---------------------------+
+| pci-mmio-bridge ring        | memcpy + poll     | Bridge device in guest    |
++-----------------------------+-------------------+---------------------------+
+
+DMA_WRITE to MMIO GPAs (``vfu_mmio_write``)
+-------------------------------------------
+
+``vfio_user_dma_write()`` dispatches incoming ``VFIO_USER_DMA_WRITE`` messages
+via ``address_space_write(&address_space_memory, ...)`` rather than
+``pci_dma_write()``.  This means the write traverses the guest's full physical
+address flatview:
+
+* **Guest RAM GPAs** — written into backing memory as before.
+* **MMIO GPAs** (IO-ops MemoryRegions: device BARs, doorbells, virtio notify
+  registers) — dispatched to the device's ``.write`` IO-ops handler.
+* **Unassigned or ROM GPAs** — ``MEMTX_DECODE_ERROR`` returned as ``ENODEV``
+  to the server; no memory is modified.
+
+On the server side, ``vfu_mmio_write()`` (from libvfio-user) sends a
+``VFIO_USER_DMA_WRITE`` message for an arbitrary GPA without requiring that GPA
+to be in the server's DMA address table:
+
+.. code-block:: c
+
+  /* Write 4 bytes to a QEMU device's BAR register at GPA 0xfebe5000 */
+  uint32_t val = 0x00000001;
+  int ret = vfu_mmio_write(ctx, 0xfebe5000, &val, sizeof(val));
+
+This is the **slow path** for MMIO writes (one socket round-trip per call).
+For high-frequency doorbells, prefer the ``HOST_DOORBELL_FD`` mechanism (one
+``eventfd_write()`` syscall, no socket) or the ``pci-mmio-bridge`` ring.
+
++-----------------------------+-------------------+---------------------------+
+| Mechanism                   | Per-write cost    | Requirement               |
++=============================+===================+===========================+
+| ``REGION_WRITE``            | 1 round-trip      | Always available          |
++-----------------------------+-------------------+---------------------------+
+| ``vfu_mmio_write``          | 1 round-trip      | No registration needed;   |
+| (``DMA_WRITE`` to MMIO)     |                   | any GPA accepted          |
++-----------------------------+-------------------+---------------------------+
+| ``HOST_DOORBELL_FD``        | 1 eventfd write   | Device uses               |
 |                             | (kernel-only)     | ``memory_region_add_      |
 |                             |                   | eventfd(..., true, ...)`` |
 +-----------------------------+-------------------+---------------------------+
