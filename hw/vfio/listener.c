@@ -39,6 +39,7 @@
 #include "migration/misc.h"
 #include "migration/qemu-file.h"
 #include "system/tcg.h"
+#include "hw/vfio-user/container.h"
 #include "system/tpm.h"
 #include "vfio-migration-internal.h"
 #include "vfio-helpers.h"
@@ -1281,6 +1282,48 @@ static void vfio_listener_log_sync(MemoryListener *listener,
     }
 }
 
+/*
+ * vfio_listener_eventfd_add - intercept ioeventfd doorbell registrations.
+ *
+ * When a device calls memory_region_add_eventfd() for a BAR register (e.g.
+ * a virtio queue notify register), this callback fires for every registered
+ * vfio memory listener.  For vfio-user containers we push the doorbell GPA
+ * to the connected server via VFIO_USER_HOST_DOORBELL_FD: the server can
+ * write to the received eventfd to trigger the MMIO write without a socket
+ * round-trip.
+ *
+ * For native VFIO containers the KVM listener handles ioeventfd setup via
+ * KVM_IOEVENTFD ioctl; we do nothing.
+ */
+static void vfio_listener_eventfd_add(MemoryListener *listener,
+                                      MemoryRegionSection *section,
+                                      bool match_data, uint64_t data,
+                                      EventNotifier *e)
+{
+    VFIOContainer *bcontainer = container_of(listener, VFIOContainer, listener);
+    VFIOUserContainer *container;
+    unsigned size;
+
+    if (!object_dynamic_cast(OBJECT(bcontainer), TYPE_VFIO_IOMMU_USER)) {
+        return;
+    }
+    container = VFIO_IOMMU_USER(bcontainer);
+
+    /* Only push fixed-value doorbells (match_data=true, e.g. virtio notify) */
+    if (!match_data) {
+        return;
+    }
+
+    size = (unsigned)int128_get64(section->size);
+    if (size == 0 || size > 8) {
+        return;
+    }
+
+    vfio_user_send_doorbell_fd(container->proxy,
+                               section->offset_within_address_space,
+                               data, size);
+}
+
 static const MemoryListener vfio_memory_listener = {
     .name = "vfio",
     .begin = vfio_listener_begin,
@@ -1290,6 +1333,7 @@ static const MemoryListener vfio_memory_listener = {
     .log_global_start = vfio_listener_log_global_start,
     .log_global_stop = vfio_listener_log_global_stop,
     .log_sync = vfio_listener_log_sync,
+    .eventfd_add = vfio_listener_eventfd_add,
 };
 
 bool vfio_listener_register(VFIOContainer *bcontainer, Error **errp)

@@ -54,6 +54,18 @@ enum proxy_state {
 
 typedef QTAILQ_HEAD(VFIOUserMsgQ, VFIOUserMsg) VFIOUserMsgQ;
 
+/*
+ * One host-doorbell registration: QEMU owns the MMIO address, the server
+ * rings the eventfd to trigger a write there without a socket round-trip.
+ */
+typedef struct VFIOUserDoorbell {
+    EventNotifier        notifier;  /* eventfd sent to the server */
+    hwaddr               gpa;       /* doorbell GPA */
+    uint64_t             datamatch; /* value written when fd fires */
+    unsigned             size;      /* access width in bytes */
+    QLIST_ENTRY(VFIOUserDoorbell) next;
+} VFIOUserDoorbell;
+
 typedef struct VFIOUserProxy {
     QLIST_ENTRY(VFIOUserProxy) next;
     char *sockname;
@@ -88,6 +100,8 @@ typedef struct VFIOUserProxy {
     VFIOUserWRMulti *wr_multi;
     int num_outgoing;
     enum proxy_state state;
+    /* host-owned MMIO doorbells advertised to this server */
+    QLIST_HEAD(, VFIOUserDoorbell) doorbells;
 } VFIOUserProxy;
 
 /* VFIOProxy flags */
@@ -128,6 +142,16 @@ void vfio_user_send_reply(VFIOUserProxy *proxy, VFIOUserHdr *hdr, int size);
 void vfio_user_send_error(VFIOUserProxy *proxy, VFIOUserHdr *hdr, int error);
 
 void vfio_user_flush_multi(VFIOUserProxy *proxy);
+
+/*
+ * vfio_user_send_doorbell_fd() — push a host MMIO doorbell eventfd to the
+ * server.  Creates an EventNotifier, registers an AIO handler on the proxy's
+ * iothread that calls address_space_write(gpa, datamatch, size) when the fd
+ * is rung, and sends VFIO_USER_HOST_DOORBELL_FD with the fd via SCM_RIGHTS.
+ * The doorbell stays active until vfio_user_disconnect().
+ */
+void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
+                                uint64_t datamatch, unsigned size);
 void vfio_user_create_multi(VFIOUserProxy *proxy);
 void vfio_user_add_multi(VFIOUserProxy *proxy, uint8_t index,
                          off_t offset, uint32_t count, void *data);

@@ -22,6 +22,10 @@
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "system/iothread.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
+#include "qemu/event_notifier.h"
+#include "qemu/aio.h"
 
 static IOThread *vfio_user_iothread;
 
@@ -942,6 +946,7 @@ VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
     QTAILQ_INIT(&proxy->outgoing);
     QTAILQ_INIT(&proxy->incoming);
     QTAILQ_INIT(&proxy->free);
+    QLIST_INIT(&proxy->doorbells);
     QTAILQ_INIT(&proxy->pending);
     QLIST_INSERT_HEAD(&vfio_user_sockets, proxy, next);
 
@@ -1014,6 +1019,17 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
 
     while (proxy->state != VFIO_PROXY_CLOSED) {
         qemu_cond_wait(&proxy->close_cv, &proxy->lock);
+    }
+
+    /* clean up host doorbell registrations */
+    {
+        VFIOUserDoorbell *db, *dbtmp;
+        QLIST_FOREACH_SAFE(db, &proxy->doorbells, next, dbtmp) {
+            aio_set_event_notifier(proxy->ctx, &db->notifier, NULL, NULL, NULL);
+            event_notifier_cleanup(&db->notifier);
+            QLIST_REMOVE(db, next);
+            g_free(db);
+        }
     }
 
     /* we now hold the only ref to proxy */
@@ -1393,4 +1409,79 @@ void vfio_user_add_multi(VFIOUserProxy *proxy, uint8_t index,
         proxy->num_outgoing < VFIO_USER_OUT_LOW) {
         vfio_user_flush_multi(proxy);
     }
+}
+
+/*
+ * vfio_user_doorbell_handler - AIO handler: server rang the eventfd,
+ * execute the MMIO write QEMU promised to perform.
+ */
+static void vfio_user_doorbell_handler(EventNotifier *n)
+{
+    VFIOUserDoorbell *db = container_of(n, VFIOUserDoorbell, notifier);
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+    event_notifier_test_and_clear(n);
+
+    /*
+     * address_space_write dispatches through the flatview: RAM regions go
+     * directly to the backing memory, IO-ops regions call the device's
+     * .write handler — exactly what we want for MMIO doorbells.
+     */
+    address_space_write(&address_space_memory, db->gpa, attrs,
+                        &db->datamatch, db->size);
+}
+
+/*
+ * vfio_user_send_doorbell_fd - register and push a host MMIO doorbell fd.
+ *
+ * Creates a new EventNotifier (eventfd), registers vfio_user_doorbell_handler
+ * on the proxy's AIO context, and sends VFIO_USER_HOST_DOORBELL_FD to the
+ * server with the fd via SCM_RIGHTS.  The server writes to the fd whenever it
+ * wants to ring the doorbell; QEMU's handler then runs address_space_write()
+ * without any socket round-trip for the actual write.
+ */
+void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
+                                uint64_t datamatch, unsigned size)
+{
+    VFIOUserDoorbell *db;
+    VFIOUserHostDoorbellFD *msg;
+    VFIOUserFDs *fds;
+    Error *err = NULL;
+
+    db = g_new0(VFIOUserDoorbell, 1);
+    db->gpa       = gpa;
+    db->datamatch = datamatch;
+    db->size      = size;
+
+    if (event_notifier_init(&db->notifier, 0) < 0) {
+        error_report("vfio_user_send_doorbell_fd: event_notifier_init failed");
+        g_free(db);
+        return;
+    }
+
+    /* Register AIO handler on the proxy's iothread */
+    aio_set_event_notifier(proxy->ctx, &db->notifier,
+                           vfio_user_doorbell_handler, NULL, NULL);
+
+    QLIST_INSERT_HEAD(&proxy->doorbells, db, next);
+
+    /* Send VFIO_USER_HOST_DOORBELL_FD to the server */
+    msg = g_new0(VFIOUserHostDoorbellFD, 1);
+    vfio_user_request_msg(&msg->hdr, VFIO_USER_HOST_DOORBELL_FD,
+                          sizeof(*msg), VFIO_USER_NO_REPLY);
+    msg->gpa       = gpa;
+    msg->datamatch = datamatch;
+    msg->size      = size;
+    msg->flags     = 0;
+
+    fds = vfio_user_getfds(1);
+    fds->send_fds    = 1;
+    fds->fds[0]      = event_notifier_get_fd(&db->notifier);
+
+    vfio_user_send_async(proxy, &msg->hdr, fds, &err);
+    if (err) {
+        error_reportf_err(err, "vfio_user_send_doorbell_fd: ");
+        /* doorbell remains registered locally even if send fails */
+    }
+    g_free(msg);
 }

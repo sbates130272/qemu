@@ -41,6 +41,14 @@ enum vfio_user_command {
     VFIO_USER_DIRTY_PAGES               = 14,
     VFIO_USER_REGION_WRITE_MULTI        = 15,
     VFIO_USER_DEVICE_FEATURE            = 16,
+    /* MIG_DATA_READ/WRITE = 17/18 are defined in libvfio-user but not used on the QEMU client side */
+    /*
+     * VFIO_USER_HOST_DOORBELL_FD = 19
+     * Client → server (NO_REPLY).  Pushes an eventfd for a QEMU-owned MMIO
+     * doorbell so the server can trigger it without a per-write socket
+     * round-trip.  One fd sent via SCM_RIGHTS in the same sendmsg().
+     */
+    VFIO_USER_HOST_DOORBELL_FD          = 19,
     VFIO_USER_MAX,
 };
 
@@ -250,5 +258,20 @@ typedef struct {
     uint32_t flags;
     char data[];
 } VFIOUserDeviceFeature;
+
+/*
+ * VFIO_USER_HOST_DOORBELL_FD
+ *
+ * Sent client → server (QEMU → device process) with NO_REPLY.
+ * Carries one eventfd via SCM_RIGHTS.  Server writes to the fd to
+ * trigger QEMU to execute:  address_space_write(gpa, datamatch, size).
+ */
+typedef struct {
+    VFIOUserHdr hdr;
+    uint64_t    gpa;        /* doorbell guest physical address */
+    uint64_t    datamatch;  /* value written to GPA when fd fires */
+    uint32_t    size;       /* access width in bytes (1/2/4/8) */
+    uint32_t    flags;      /* reserved, 0 */
+} VFIOUserHostDoorbellFD;
 
 #endif /* VFIO_USER_PROTOCOL_H */
