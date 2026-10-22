@@ -1444,7 +1444,7 @@ void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
                                 uint64_t datamatch, unsigned size)
 {
     VFIOUserDoorbell *db;
-    VFIOUserHostDoorbellFD *msg;  /* alias into db->msg */
+    VFIOUserHostDoorbellFD *msg;
     VFIOUserFDs *fds;
     Error *err = NULL;
 
@@ -1466,12 +1466,13 @@ void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
     QLIST_INSERT_HEAD(&proxy->doorbells, db, next);
 
     /*
-     * Build the wire message in-place inside db->msg.  The buffer must stay
-     * alive until the async send completes, so we never free it separately —
-     * it is part of the VFIOUserDoorbell which is freed in
-     * vfio_user_disconnect().
+     * Allocate the wire message separately so vfio_user_send_async() can take
+     * ownership and free it (via g_free(msg->hdr) in vfio_user_recycle()) once
+     * the iothread has sent it.  Embedding the msg in VFIOUserDoorbell caused
+     * "free(): invalid pointer" because g_free() was called on a non-malloc-start
+     * address.
      */
-    msg = &db->msg;
+    msg = g_new0(VFIOUserHostDoorbellFD, 1);
     vfio_user_request_msg(&msg->hdr, VFIO_USER_HOST_DOORBELL_FD,
                           sizeof(*msg), VFIO_USER_NO_REPLY);
     msg->gpa       = gpa;
@@ -1483,6 +1484,7 @@ void vfio_user_send_doorbell_fd(VFIOUserProxy *proxy, hwaddr gpa,
     fds->send_fds    = 1;
     fds->fds[0]      = event_notifier_get_fd(&db->notifier);
 
+    /* send_async takes ownership of msg and fds; do NOT free them here */
     vfio_user_send_async(proxy, &msg->hdr, fds, &err);
     if (err) {
         error_reportf_err(err, "vfio_user_send_doorbell_fd: ");
