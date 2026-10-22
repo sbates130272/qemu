@@ -15,6 +15,7 @@
 #include "hw/vfio/pci.h"
 #include "hw/vfio-user/device.h"
 #include "hw/vfio-user/proxy.h"
+#include "system/address-spaces.h"
 
 #define TYPE_VFIO_USER_PCI "vfio-user-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(VFIOUserPCIDevice, VFIO_USER_PCI)
@@ -138,7 +139,6 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 
 static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 {
-    PCIDevice *pdev = PCI_DEVICE(vdev);
     VFIOUserProxy *proxy = vdev->vbasedev.proxy;
     VFIOUserDMARW *res;
     MemTxResult r;
@@ -153,7 +153,16 @@ static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         return;
     }
 
-    r = pci_dma_write(pdev, msg->offset, &msg->data, msg->count);
+    /*
+     * Use address_space_write() rather than pci_dma_write() so that writes
+     * to MMIO GPAs (IO-ops MemoryRegions) are dispatched correctly.
+     * pci_dma_write() gates on bus-master-enable and routes through the IOMMU
+     * address space; for vfio-user on non-IOMMU buses the destination is the
+     * same (address_space_memory), but the MMIO dispatch path is preserved.
+     * Writes to unassigned or ROM GPAs return MEMTX_DECODE_ERROR silently.
+     */
+    r = address_space_write(&address_space_memory, msg->offset,
+                            MEMTXATTRS_UNSPECIFIED, &msg->data, msg->count);
 
     res = g_malloc0(sizeof(*res));
     memcpy(res, msg, sizeof(*res));
