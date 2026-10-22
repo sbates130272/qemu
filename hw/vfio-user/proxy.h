@@ -63,6 +63,12 @@ typedef struct VFIOUserDoorbell {
     hwaddr               gpa;       /* doorbell GPA */
     uint64_t             datamatch; /* value written when fd fires */
     unsigned             size;      /* access width in bytes */
+    /*
+     * Wire message kept alive until the doorbell is torn down.
+     * vfio_user_send_async() stores a pointer into hdr, so the buffer must
+     * outlive the async send — it is freed in vfio_user_disconnect().
+     */
+    VFIOUserHostDoorbellFD msg;
     QLIST_ENTRY(VFIOUserDoorbell) next;
 } VFIOUserDoorbell;
 

@@ -1319,6 +1319,22 @@ static void vfio_listener_eventfd_add(MemoryListener *listener,
         return;
     }
 
+    /*
+     * address_space_update_ioeventfds() may fire multiple times during
+     * memory transactions for the same ioeventfd.  Skip if a doorbell with
+     * this exact (gpa, datamatch, size) triple is already registered so we
+     * only push one HOST_DOORBELL_FD message per logical doorbell.
+     */
+    {
+        VFIOUserDoorbell *db;
+        hwaddr gpa = section->offset_within_address_space;
+        QLIST_FOREACH(db, &container->proxy->doorbells, next) {
+            if (db->gpa == gpa && db->datamatch == data && db->size == size) {
+                return; /* already registered for this doorbell */
+            }
+        }
+    }
+
     vfio_user_send_doorbell_fd(container->proxy,
                                section->offset_within_address_space,
                                data, size);

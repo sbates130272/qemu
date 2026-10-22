@@ -92,6 +92,15 @@ struct PCITestDevState {
     uint64_t membar_size;
     bool membar_backed;
     MemoryRegion membar;
+
+    /*
+     * Doorbell test for vfio-user Option B (VFIO_USER_HOST_DOORBELL_FD).
+     * Registered unconditionally in realize so that any connected vfio-user
+     * server receives the eventfd without requiring guest driver interaction.
+     * A write of IOTEST_DATAMATCH to BAR0 offset 0 rings this notifier.
+     */
+    EventNotifier doorbell_notifier;
+    bool          doorbell_notifier_init;
 };
 
 #define TYPE_PCI_TEST_DEV "pci-testdev"
@@ -302,6 +311,20 @@ static void pci_testdev_realize(PCIDevice *pci_dev, Error **errp)
         assert(r >= 0);
         test->hasnotifier = true;
     }
+
+    /*
+     * Register a permanent doorbell eventfd at BAR0 offset 0 so that any
+     * connected vfio-user server receives VFIO_USER_HOST_DOORBELL_FD during
+     * session setup, enabling it to ring the doorbell without a socket
+     * round-trip.  The notifier fires when the guest writes IOTEST_DATAMATCH
+     * (0x12345678) to BAR0 offset 0.
+     */
+    if (event_notifier_init(&d->doorbell_notifier, 0) == 0) {
+        memory_region_add_eventfd(&d->mmio, 0, IOTEST_ACCESS_WIDTH,
+                                  true, IOTEST_DATAMATCH,
+                                  &d->doorbell_notifier);
+        d->doorbell_notifier_init = true;
+    }
 }
 
 static void
@@ -318,6 +341,13 @@ pci_testdev_uninit(PCIDevice *dev)
         g_free(d->tests[i].hdr);
     }
     g_free(d->tests);
+
+    if (d->doorbell_notifier_init) {
+        memory_region_del_eventfd(&d->mmio, 0, IOTEST_ACCESS_WIDTH,
+                                  true, IOTEST_DATAMATCH,
+                                  &d->doorbell_notifier);
+        event_notifier_cleanup(&d->doorbell_notifier);
+    }
 }
 
 static void qdev_pci_testdev_reset(DeviceState *dev)
