@@ -19,6 +19,7 @@
 #define HW_NVME_NVME_H
 
 #include "qemu/uuid.h"
+#include "qemu/timer.h"
 #include "hw/pci/pci_device.h"
 #include "hw/block/block.h"
 
@@ -587,6 +588,9 @@ typedef struct NvmeParams {
     uint16_t atomic_awun;
     uint16_t atomic_awupf;
     bool     atomic_dn;
+
+    uint64_t dbbuf_poll_ns;
+    bool     dbbuf_poll_eventidx;
 } NvmeParams;
 
 typedef struct NvmeCtrl {
@@ -689,6 +693,8 @@ typedef struct NvmeCtrl {
     /* VFIO passthrough device whose BAR is the VRAM aperture for P2P DMA */
     PCIDevice *vram_dev;
     uint8_t    vram_bar;
+
+    QEMUTimer *dbbuf_poll_timer;
 } NvmeCtrl;
 
 typedef enum NvmeResetType {

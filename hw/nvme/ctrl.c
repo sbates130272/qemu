@@ -328,6 +328,7 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst);
 static inline uint64_t nvme_get_timestamp(const NvmeCtrl *n);
 static inline bool nvme_addr_is_vram(NvmeCtrl *n, hwaddr addr, hwaddr len);
 static void *nvme_addr_to_vram(NvmeCtrl *n, hwaddr addr, hwaddr len);
+static void nvme_update_sq_tail(NvmeSQueue *sq);
 
 static uint16_t nvme_sqid(NvmeRequest *req)
 {
@@ -7547,6 +7548,29 @@ static uint16_t nvme_virt_mngmt(NvmeCtrl *n, NvmeRequest *req)
     }
 }
 
+static void nvme_dbbuf_poll(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+
+    assert(bql_locked());
+    for (uint32_t i = 1; i <= n->params.max_ioqpairs; i++) {
+        NvmeSQueue *sq = n->sq[i];
+
+        if (sq && sq->db_addr) {
+            uint32_t old = sq->tail;
+
+            nvme_update_sq_tail(sq);
+            if (sq->tail != old) {
+                trace_pci_nvme_dbbuf_poll_tail(sq->sqid, sq->tail);
+                qemu_bh_schedule(sq->bh);
+            }
+        }
+    }
+
+    timer_mod(n->dbbuf_poll_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + n->params.dbbuf_poll_ns);
+}
+
 static uint16_t nvme_dbbuf_config(NvmeCtrl *n, const NvmeRequest *req)
 {
     PCIDevice *pci = PCI_DEVICE(n);
@@ -7597,6 +7621,12 @@ static uint16_t nvme_dbbuf_config(NvmeCtrl *n, const NvmeRequest *req)
                 }
             }
         }
+    }
+
+    if (n->params.dbbuf_poll_ns) {
+        timer_mod(n->dbbuf_poll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  n->params.dbbuf_poll_ns);
     }
 
     trace_pci_nvme_dbbuf_config(dbs_addr, eis_addr);
@@ -8141,7 +8171,9 @@ static void nvme_process_sq(void *opaque)
         }
 
         if (n->dbbuf_enabled) {
-            nvme_update_sq_eventidx(sq);
+            if (!n->params.dbbuf_poll_ns || n->params.dbbuf_poll_eventidx) {
+                nvme_update_sq_eventidx(sq);
+            }
             nvme_update_sq_tail(sq);
         }
     }
@@ -8263,6 +8295,8 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
     stl_le_p(&n->bar.intms, 0);
     stl_le_p(&n->bar.intmc, 0);
     stl_le_p(&n->bar.cc, 0);
+
+    timer_del(n->dbbuf_poll_timer);
 
     n->dbbuf_dbs = 0;
     n->dbbuf_eis = 0;
@@ -9829,6 +9863,8 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
     }
     nvme_init_ctrl(n, pci_dev);
 
+    n->dbbuf_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nvme_dbbuf_poll, n);
+
     /* setup a namespace if the controller drive property was given */
     if (n->namespace.blkconf.blk) {
         ns = &n->namespace;
@@ -9855,6 +9891,8 @@ static void nvme_exit(PCIDevice *pci_dev)
     int i;
 
     nvme_ctrl_reset(n, NVME_RESET_FUNCTION);
+
+    timer_free(n->dbbuf_poll_timer);
 
     for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
         ns = nvme_ns(n, i);
@@ -9952,6 +9990,9 @@ static const Property nvme_props[] = {
     DEFINE_PROP_LINK("vram-dev", NvmeCtrl, vram_dev, TYPE_PCI_DEVICE,
                      PCIDevice *),
     DEFINE_PROP_UINT8("vram-bar", NvmeCtrl, vram_bar, 0),
+    DEFINE_PROP_UINT64("dbbuf-poll-ns", NvmeCtrl, params.dbbuf_poll_ns, 0),
+    DEFINE_PROP_BOOL("dbbuf-poll-eventidx", NvmeCtrl,
+                     params.dbbuf_poll_eventidx, true),
 };
 
 static void nvme_get_smart_warning(Object *obj, Visitor *v, const char *name,
