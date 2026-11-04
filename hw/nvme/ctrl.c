@@ -326,6 +326,8 @@ static const uint32_t nvme_cse_iocs_zoned_default[256] = {
 static void nvme_process_sq(void *opaque);
 static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst);
 static inline uint64_t nvme_get_timestamp(const NvmeCtrl *n);
+static inline bool nvme_addr_is_vram(NvmeCtrl *n, hwaddr addr, hwaddr len);
+static void *nvme_addr_to_vram(NvmeCtrl *n, hwaddr addr, hwaddr len);
 
 static uint16_t nvme_sqid(NvmeRequest *req)
 {
@@ -594,6 +596,15 @@ static int nvme_addr_read(NvmeCtrl *n, hwaddr addr, void *buf, int size)
         return 0;
     }
 
+    if (nvme_addr_is_vram(n, addr, size)) {
+        void *p = nvme_addr_to_vram(n, addr, size);
+        if (!p) {
+            return 1;
+        }
+        memcpy(buf, p, size);
+        return 0;
+    }
+
     return pci_dma_read(PCI_DEVICE(n), addr, buf, size);
 }
 
@@ -611,6 +622,15 @@ static int nvme_addr_write(NvmeCtrl *n, hwaddr addr, const void *buf, int size)
 
     if (nvme_addr_is_pmr(n, addr) && nvme_addr_is_pmr(n, hi)) {
         memcpy(nvme_addr_to_pmr(n, addr), buf, size);
+        return 0;
+    }
+
+    if (nvme_addr_is_vram(n, addr, size)) {
+        void *p = nvme_addr_to_vram(n, addr, size);
+        if (!p) {
+            return 1;
+        }
+        memcpy(p, buf, size);
         return 0;
     }
 
@@ -850,6 +870,28 @@ static inline bool nvme_addr_is_vram(NvmeCtrl *n, hwaddr addr, hwaddr len)
 }
 
 /*
+ * Translate a VRAM guest physical address to a host virtual pointer.
+ * Returns NULL if the address is not backed by a suitable RAM region.
+ */
+static void *nvme_addr_to_vram(NvmeCtrl *n, hwaddr addr, hwaddr len)
+{
+    MemoryRegion *mr;
+    hwaddr xlat, remaining;
+    void *host_ptr;
+
+    mr = address_space_translate(&address_space_memory, addr, &xlat,
+                                 &remaining, false, MEMTXATTRS_UNSPECIFIED);
+    if (!mr || !memory_region_is_ram(mr) || !mr->ram_block) {
+        return NULL;
+    }
+    host_ptr = memory_region_get_ram_ptr(mr);
+    if (!host_ptr) {
+        return NULL;
+    }
+    return (void *)((uintptr_t)host_ptr + xlat);
+}
+
+/*
  * Map GPU VRAM address for P2P DMA.
  *
  * For addresses in the VRAM range, this function directly maps the
@@ -862,53 +904,19 @@ static inline bool nvme_addr_is_vram(NvmeCtrl *n, hwaddr addr, hwaddr len)
 static uint16_t nvme_map_addr_vram(NvmeCtrl *n, QEMUIOVector *iov, hwaddr addr,
                                    size_t len)
 {
-    MemoryRegion *mr;
-    hwaddr xlat, remaining;
     void *host_ptr;
-    
+
     if (!len) {
         return NVME_SUCCESS;
     }
 
     trace_pci_nvme_vram_p2p_read(addr, len);
 
-    /*
-     * Translate the guest physical address to find the backing memory region.
-     * For VFIO passthrough GPUs, this should resolve to the mmap'd BAR.
-     */
-    mr = address_space_translate(&address_space_memory, addr, &xlat,
-                                 &remaining, false, MEMTXATTRS_UNSPECIFIED);
-    
-    if (!mr) {
-        return NVME_DATA_TRAS_ERROR;
-    }
-
-    trace_pci_nvme_vram_p2p_mr_found(addr, memory_region_name(mr),
-                                     memory_region_size(mr),
-                                     memory_region_is_ram(mr));
-
-    /*
-     * Verify the memory region is suitable for direct access.
-     * VFIO device BARs are typically backed by RAM (mmap'd device memory)
-     * and have a ram_block.
-     */
-    if (!memory_region_is_ram(mr) || !mr->ram_block) {
-        return NVME_DATA_TRAS_ERROR;
-    }
-
-    /*
-     * Get the host virtual address of the mapped BAR and adjust for
-     * the offset within the memory region.
-     */
-    host_ptr = memory_region_get_ram_ptr(mr);
+    host_ptr = nvme_addr_to_vram(n, addr, len);
     if (!host_ptr) {
         return NVME_DATA_TRAS_ERROR;
     }
-    
-    host_ptr = (void*)((uintptr_t)host_ptr + xlat);
-    trace_pci_nvme_vram_p2p_direct_ptr(host_ptr, xlat);
-    
-    /* Add the memory directly to the I/O vector - no copy needed */
+
     qemu_iovec_add(iov, host_ptr, len);
     return NVME_SUCCESS;
 }
@@ -1704,8 +1712,7 @@ static void nvme_post_cqes(void *opaque)
         trace_pci_nvme_cqe_dma_write(nvme_cid(req), cq->cqid, addr,
                                      le32_to_cpu(req->cqe.result),
                                      le32_to_cpu(req->cqe.dw1), req->status);
-        ret = pci_dma_write(PCI_DEVICE(n), addr, (void *)&req->cqe,
-                            sizeof(req->cqe));
+        ret = nvme_addr_write(n, addr, (void *)&req->cqe, sizeof(req->cqe));
         if (ret) {
             trace_pci_nvme_err_addr_write(addr);
             trace_pci_nvme_err_cfs();
