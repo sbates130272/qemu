@@ -7972,16 +7972,32 @@ static uint16_t nvme_admin_cmd(NvmeCtrl *n, NvmeRequest *req)
 
 static void nvme_update_sq_eventidx(const NvmeSQueue *sq)
 {
+    uint32_t val = cpu_to_le32(sq->tail);
+
     trace_pci_nvme_update_sq_eventidx(sq->sqid, sq->tail);
 
-    stl_le_pci_dma(PCI_DEVICE(sq->ctrl), sq->ei_addr, sq->tail,
-                   MEMTXATTRS_UNSPECIFIED);
+    address_space_write(&address_space_memory, sq->ei_addr,
+                        MEMTXATTRS_UNSPECIFIED, &val, sizeof(val));
 }
 
 static void nvme_update_sq_tail(NvmeSQueue *sq)
 {
-    ldl_le_pci_dma(PCI_DEVICE(sq->ctrl), sq->db_addr, &sq->tail,
-                   MEMTXATTRS_UNSPECIFIED);
+    uint32_t val;
+    MemTxResult ret;
+
+    /*
+     * Shadow doorbell memory is always guest RAM. Read via address_space_memory
+     * directly so that a virtual IOMMU (e.g. VT-d emulation) in the NVMe
+     * device's bus_master_as cannot block the access — the kernel may remove
+     * the IOMMU mappings for a borrowed queue while handing it to the GPU.
+     */
+    ret = address_space_read(&address_space_memory, sq->db_addr,
+                             MEMTXATTRS_UNSPECIFIED, &val, sizeof(val));
+    if (ret == MEMTX_OK) {
+        sq->tail = le32_to_cpu(val);
+    } else {
+        trace_pci_nvme_err_dbbuf_read(sq->sqid, sq->db_addr);
+    }
 
     trace_pci_nvme_update_sq_tail(sq->sqid, sq->tail);
 }
