@@ -591,6 +591,8 @@ typedef struct NvmeParams {
 
     uint64_t dbbuf_poll_ns;
     bool     dbbuf_poll_eventidx;
+
+    char    *vram_dev_id;
 } NvmeParams;
 
 typedef struct NvmeCtrl {

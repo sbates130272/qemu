@@ -856,9 +856,22 @@ static uint16_t nvme_map_addr_pmr(NvmeCtrl *n, QEMUIOVector *iov, hwaddr addr,
 
 static inline bool nvme_addr_is_vram(NvmeCtrl *n, hwaddr addr, hwaddr len)
 {
-    PCIDevice *dev = n->vram_dev;
+    PCIDevice *dev;
     hwaddr base, size;
 
+    if (!n->vram_dev && n->params.vram_dev_id) {
+        char path[512];
+        Object *obj;
+
+        snprintf(path, sizeof(path), "/machine/peripheral/%s",
+                 n->params.vram_dev_id);
+        obj = object_resolve_path_type(path, TYPE_PCI_DEVICE, NULL);
+        if (obj) {
+            n->vram_dev = PCI_DEVICE(obj);
+        }
+    }
+
+    dev = n->vram_dev;
     if (!dev) {
         return false;
     }
@@ -8301,6 +8314,7 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
     n->dbbuf_dbs = 0;
     n->dbbuf_eis = 0;
     n->dbbuf_enabled = false;
+    n->vram_dev = NULL;
 }
 
 static void nvme_ctrl_shutdown(NvmeCtrl *n)
@@ -9987,8 +10001,7 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
     DEFINE_PROP_UINT16("atomic.awupf", NvmeCtrl, params.atomic_awupf, 0),
     DEFINE_PROP_BOOL("ocp", NvmeCtrl, params.ocp, false),
-    DEFINE_PROP_LINK("vram-dev", NvmeCtrl, vram_dev, TYPE_PCI_DEVICE,
-                     PCIDevice *),
+    DEFINE_PROP_STRING("vram-dev", NvmeCtrl, params.vram_dev_id),
     DEFINE_PROP_UINT8("vram-bar", NvmeCtrl, vram_bar, 0),
     DEFINE_PROP_UINT64("dbbuf-poll-ns", NvmeCtrl, params.dbbuf_poll_ns, 0),
     DEFINE_PROP_BOOL("dbbuf-poll-eventidx", NvmeCtrl,
