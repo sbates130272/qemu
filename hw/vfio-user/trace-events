@@ -6,6 +6,10 @@
 vfio_user_dma_map(uint64_t iova, uint64_t size, uint64_t off, uint32_t flags, bool async_ops) " iova 0x%"PRIx64" size 0x%"PRIx64" off 0x%"PRIx64" flags 0x%x async_ops %d"
 vfio_user_dma_unmap(uint64_t iova, uint64_t size, uint32_t flags,  bool async_ops) " iova 0x%"PRIx64" size 0x%"PRIx64" flags 0x%x async_ops %d"
 
+# peer-mmio.c
+vfio_user_peer_mmio_add(const char *owner, uint64_t iova, uint64_t size, bool readonly) " BAR of %s iova 0x%"PRIx64" size 0x%"PRIx64" readonly %d"
+vfio_user_peer_mmio_del(uint64_t iova, uint64_t size) " iova 0x%"PRIx64" size 0x%"PRIx64
+
 # device.c
 vfio_user_device_io_device_feature(uint32_t argsz, uint32_t flags) " argsz 0x%x flags 0x%x"
 vfio_user_get_info(uint32_t nregions, uint32_t nirqs) " #regions %d #irqs %d"

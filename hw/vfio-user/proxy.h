@@ -95,6 +95,7 @@ typedef struct VFIOUserProxy {
 #define VFIO_PROXY_FORCE_QUEUED  BIT(1)
 #define VFIO_PROXY_NO_POST       BIT(2)
 #define VFIO_PROXY_USE_MULTI     BIT(3)
+#define VFIO_PROXY_PEER_MMIO     BIT(4)
 
 /* coalescing high and low water marks for VFIOProxy num_outgoing */
 #define VFIO_USER_OUT_HIGH       1024

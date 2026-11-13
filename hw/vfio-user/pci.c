@@ -26,6 +26,7 @@ struct VFIOUserPCIDevice {
     bool send_queued;   /* all sends are queued */
     uint32_t wait_time; /* timeout for message replies */
     bool no_post;       /* all region writes are sync */
+    bool peer_mmio;     /* announce other devices' BARs to the server */
 };
 
 /*
@@ -288,6 +289,11 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
         proxy->flags |= VFIO_PROXY_NO_POST;
     }
 
+    /* Read when the container is created, by vfio_user_container_connect(). */
+    if (udev->peer_mmio) {
+        proxy->flags |= VFIO_PROXY_PEER_MMIO;
+    }
+
     /* user specified or 5 sec default */
     proxy->wait_time = udev->wait_time;
 
@@ -426,6 +432,7 @@ static const Property vfio_user_pci_properties[] = {
     DEFINE_PROP_BOOL("x-send-queued", VFIOUserPCIDevice, send_queued, false),
     DEFINE_PROP_UINT32("x-msg-timeout", VFIOUserPCIDevice, wait_time, 5000),
     DEFINE_PROP_BOOL("x-no-posted-writes", VFIOUserPCIDevice, no_post, false),
+    DEFINE_PROP_BOOL("x-peer-mmio", VFIOUserPCIDevice, peer_mmio, false),
 };
 
 static void vfio_user_pci_set_socket(Object *obj, Visitor *v, const char *name,

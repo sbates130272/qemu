@@ -81,13 +81,15 @@ static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
     return ret;
 }
 
-static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
-                             uint64_t size, void *vaddr, bool readonly,
-                             MemoryRegion *mrp)
+/*
+ * Send a DMA_MAP for [iova, iova + size).  With an fd the server may map it
+ * and access it directly at offset; with fd == -1 it can only reach the range
+ * through DMA_READ/DMA_WRITE messages, which QEMU services.
+ */
+int vfio_user_container_dma_map(VFIOUserContainer *container, hwaddr iova,
+                                uint64_t size, int fd, uint64_t offset,
+                                bool readonly)
 {
-    VFIOUserContainer *container = VFIO_IOMMU_USER(bcontainer);
-
-    int fd = memory_region_get_fd(mrp);
     Error *local_err = NULL;
     int ret = 0;
 
@@ -97,17 +99,9 @@ static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
     vfio_user_request_msg(&msgp->hdr, VFIO_USER_DMA_MAP, sizeof(*msgp), 0);
     msgp->argsz = sizeof(struct vfio_iommu_type1_dma_map);
     msgp->flags = VFIO_DMA_MAP_FLAG_READ;
-    msgp->offset = 0;
+    msgp->offset = offset;
     msgp->iova = iova;
     msgp->size = size;
-
-    /*
-     * vaddr enters as a QEMU process address; make it either a file offset
-     * for mapped areas or leave as 0.
-     */
-    if (fd != -1) {
-        msgp->offset = qemu_ram_block_host_offset(mrp->ram_block, vaddr);
-    }
 
     if (!readonly) {
         msgp->flags |= VFIO_DMA_MAP_FLAG_WRITE;
@@ -152,6 +146,32 @@ static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
     }
 
     return ret;
+}
+
+static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
+                             uint64_t size, void *vaddr, bool readonly,
+                             MemoryRegion *mrp)
+{
+    VFIOUserContainer *container = VFIO_IOMMU_USER(bcontainer);
+    int fd = memory_region_get_fd(mrp);
+    uint64_t offset = 0;
+
+    /*
+     * vaddr enters as a QEMU process address; make it either a file offset
+     * for mapped areas or leave as 0.
+     */
+    if (fd != -1) {
+        offset = qemu_ram_block_host_offset(mrp->ram_block, vaddr);
+    }
+
+    return vfio_user_container_dma_map(container, iova, size, fd, offset,
+                                       readonly);
+}
+
+int vfio_user_container_dma_unmap(VFIOUserContainer *container, hwaddr iova,
+                                  uint64_t size)
+{
+    return vfio_user_dma_unmap(VFIO_IOMMU(container), iova, size, NULL, false);
 }
 
 static int
@@ -238,6 +258,10 @@ vfio_user_container_connect(AddressSpace *as, VFIODevice *vbasedev,
         goto listener_release_exit;
     }
 
+    if (vbasedev->proxy->flags & VFIO_PROXY_PEER_MMIO) {
+        vfio_user_peer_mmio_register(container, as, vbasedev->dev);
+    }
+
     bcontainer->initialized = true;
 
     return container;
@@ -268,6 +292,7 @@ static void vfio_user_container_disconnect(VFIOUserContainer *container)
 
     ram_block_uncoordinated_discard_disable(false);
 
+    vfio_user_peer_mmio_unregister(container);
     vfio_listener_unregister(bcontainer);
     if (vioc->release) {
         vioc->release(bcontainer);

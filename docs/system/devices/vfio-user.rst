@@ -22,5 +22,28 @@ Presuming a suitable ``vfio-user`` server has opened a socket at
 
   --device '{"driver": "vfio-user-pci","socket": {"path": "/tmp/vfio-user.sock", "type": "unix"}}'
 
+Peer access to other devices' BARs
+----------------------------------
+
+By default a ``vfio-user`` server can reach guest RAM with ``DMA_READ`` and
+``DMA_WRITE``, and nothing else: QEMU only tells it about RAM (``DMA_MAP``), so
+an address inside another device's BAR, such as a doorbell, is unknown to the
+server's DMA table. Setting ``x-peer-mmio=on`` on the ``vfio-user-pci`` device
+makes QEMU also announce the memory BARs of the *other* PCI devices in the guest
+to that server. They are announced without a file descriptor, so the server
+cannot map them: it accesses them with ``DMA_READ`` and ``DMA_WRITE`` messages,
+and QEMU performs those as ordinary MMIO accesses on the target BAR, whether
+that device is a QEMU device or another ``vfio-user`` server.
+
+.. code-block:: console
+
+  --device '{"driver": "vfio-user-pci","socket": {"path": "/tmp/vfio-user.sock", "type": "unix"}, "x-peer-mmio": true}'
+
+The property is off by default, and applies to the one device it is set on, so
+it acts like a per-device access policy. The device's own BARs, the config
+space (ECAM) and platform MMIO are never announced. The server still needs PCI
+Bus Master Enable set on its device for its writes to reach the target, as for
+any DMA, and a guest IOMMU in front of the device is not supported.
+
 See `libvfio-user <https://github.com/nutanix/libvfio-user/>`_ for further
 information.
