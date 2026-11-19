@@ -43,7 +43,12 @@ The property is off by default, and applies to the one device it is set on, so
 it acts like a per-device access policy. The device's own BARs, the config
 space (ECAM) and platform MMIO are never announced. The server still needs PCI
 Bus Master Enable set on its device for its writes to reach the target, as for
-any DMA, and a guest IOMMU in front of the device is not supported.
+any DMA.
+
+If a guest IOMMU translates the device, a peer BAR is announced at the IOVA the
+guest mapped it at, and only while the guest keeps that mapping, so the server
+can reach exactly what the guest allowed the device to reach. Without a mapping
+the BAR is unreachable, as it would be for a device doing DMA on hardware.
 
 See `libvfio-user <https://github.com/nutanix/libvfio-user/>`_ for further
 information.
