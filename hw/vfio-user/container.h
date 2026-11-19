@@ -12,6 +12,7 @@
 #include "hw/vfio-user/proxy.h"
 
 typedef struct VFIOUserPeerMMIO VFIOUserPeerMMIO;
+typedef struct VFIOUserDMARange VFIOUserDMARange;
 
 /* MMU container sub-class for vfio-user. */
 struct VFIOUserContainer {
@@ -21,6 +22,13 @@ struct VFIOUserContainer {
 
     /* Non-NULL only when the device has x-peer-mmio=on. */
     VFIOUserPeerMMIO *peer_mmio;
+
+    /*
+     * What the server was sent with DMA_MAP and not yet told to unmap: a
+     * DMA_UNMAP must name a mapping exactly, but the requests to unmap come
+     * from the memory core and from a vIOMMU as arbitrary ranges.
+     */
+    QLIST_HEAD(, VFIOUserDMARange) dma_ranges;
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(VFIOUserContainer, VFIO_IOMMU_USER);

@@ -17,6 +17,7 @@
 #include "hw/vfio/vfio-listener.h"
 #include "system/ramblock.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 
 /*
  * When DMA space is the physical address space, the region add/del listeners
@@ -39,12 +40,44 @@ static void vfio_user_listener_commit(VFIOContainer *bcontainer)
     vfio_user_wait_reqs(container->proxy);
 }
 
-static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
-                               hwaddr iova, uint64_t size,
-                               IOMMUTLBEntry *iotlb, bool unmap_all)
-{
-    VFIOUserContainer *container = VFIO_IOMMU_USER(bcontainer);
+struct VFIOUserDMARange {
+    QLIST_ENTRY(VFIOUserDMARange) next;
+    hwaddr iova;
+    uint64_t size;
+    int fd;             /* -1: reached by DMA_READ/DMA_WRITE only; not owned */
+    uint64_t offset;    /* of iova within fd */
+    bool readonly;
+};
 
+static void vfio_user_track_dma(VFIOUserContainer *container, hwaddr iova,
+                                uint64_t size, int fd, uint64_t offset,
+                                bool readonly)
+{
+    VFIOUserDMARange *r;
+
+    /* The server accepts the same mapping twice; keep one record of it. */
+    QLIST_FOREACH(r, &container->dma_ranges, next) {
+        if (r->iova == iova && r->size == size) {
+            r->fd = fd;
+            r->offset = offset;
+            r->readonly = readonly;
+            return;
+        }
+    }
+
+    r = g_new0(VFIOUserDMARange, 1);
+    r->iova = iova;
+    r->size = size;
+    r->fd = fd;
+    r->offset = offset;
+    r->readonly = readonly;
+    QLIST_INSERT_HEAD(&container->dma_ranges, r, next);
+}
+
+/* Send one DMA_UNMAP, which must name a mapping the server holds exactly. */
+static int vfio_user_send_dma_unmap(VFIOUserContainer *container,
+                                    hwaddr iova, uint64_t size)
+{
     Error *local_err = NULL;
     int ret = 0;
 
@@ -52,7 +85,7 @@ static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
 
     vfio_user_request_msg(&msgp->hdr, VFIO_USER_DMA_UNMAP, sizeof(*msgp), 0);
     msgp->argsz = sizeof(struct vfio_iommu_type1_dma_unmap);
-    msgp->flags = unmap_all ? VFIO_DMA_UNMAP_FLAG_ALL : 0;
+    msgp->flags = 0;
     msgp->iova = iova;
     msgp->size = size;
     trace_vfio_user_dma_unmap(msgp->iova, msgp->size, msgp->flags,
@@ -145,6 +178,10 @@ int vfio_user_container_dma_map(VFIOUserContainer *container, hwaddr iova,
         g_free(msgp);
     }
 
+    if (ret == 0) {
+        vfio_user_track_dma(container, iova, size, fd, offset, readonly);
+    }
+
     return ret;
 }
 
@@ -166,6 +203,80 @@ static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
 
     return vfio_user_container_dma_map(container, iova, size, fd, offset,
                                        readonly);
+}
+
+/*
+ * Unmap [iova, iova + size), or everything when @unmap_all.
+ *
+ * The memory core asks for the ranges it added, but a vIOMMU asks for whatever
+ * the guest changed, including its whole address space in power-of-two chunks
+ * when a domain is dropped.  A server removes only a mapping it holds exactly
+ * (the spec says so), so a request that does not match one is answered with
+ * ENOENT and the mapping stays: the server keeps reaching memory the guest has
+ * unmapped, and a later map at that address with a different backing is
+ * refused.  So turn the request into exact unmaps of the ranges sent, which
+ * for a range never sent is nothing, as for kernel VFIO.  A request that cuts
+ * through a mapping can only remove all of it; map the rest back.
+ */
+static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
+                               hwaddr iova, uint64_t size,
+                               IOMMUTLBEntry *iotlb, bool unmap_all)
+{
+    VFIOUserContainer *container = VFIO_IOMMU_USER(bcontainer);
+    VFIOUserDMARange *r, *tmp;
+    GArray *rest = g_array_new(false, false, sizeof(VFIOUserDMARange));
+    hwaddr end = iova + size;
+    int ret = 0;
+    guint i;
+
+    QLIST_FOREACH_SAFE(r, &container->dma_ranges, next, tmp) {
+        hwaddr r_end = r->iova + r->size;
+        int err;
+
+        if (!unmap_all && (r_end <= iova || r->iova >= end)) {
+            continue;
+        }
+
+        trace_vfio_user_dma_unmap_range(r->iova, r->size, iova, size);
+        err = vfio_user_send_dma_unmap(container, r->iova, r->size);
+        if (err && !ret) {
+            ret = err;
+        }
+        QLIST_REMOVE(r, next);
+
+        if (!unmap_all) {
+            VFIOUserDMARange keep;
+
+            if (r->iova < iova) {
+                keep = *r;
+                keep.size = iova - r->iova;
+                g_array_append_val(rest, keep);
+            }
+            if (r_end > end) {
+                keep = *r;
+                keep.iova = end;
+                keep.size = r_end - end;
+                keep.offset = r->offset + (end - r->iova);
+                g_array_append_val(rest, keep);
+            }
+        }
+        g_free(r);
+    }
+
+    for (i = 0; i < rest->len; i++) {
+        VFIOUserDMARange *keep = &g_array_index(rest, VFIOUserDMARange, i);
+
+        if (vfio_user_container_dma_map(container, keep->iova, keep->size,
+                                        keep->fd, keep->offset,
+                                        keep->readonly)) {
+            error_report("vfio-user: cannot map back 0x%"PRIx64" size "
+                         "0x%"PRIx64" after an unmap of part of it",
+                         keep->iova, keep->size);
+        }
+    }
+    g_array_free(rest, true);
+
+    return ret;
 }
 
 int vfio_user_container_dma_unmap(VFIOUserContainer *container, hwaddr iova,
@@ -293,6 +404,12 @@ static void vfio_user_container_disconnect(VFIOUserContainer *container)
     ram_block_uncoordinated_discard_disable(false);
 
     vfio_user_peer_mmio_unregister(container);
+    while (!QLIST_EMPTY(&container->dma_ranges)) {
+        VFIOUserDMARange *r = QLIST_FIRST(&container->dma_ranges);
+
+        QLIST_REMOVE(r, next);
+        g_free(r);
+    }
     vfio_listener_unregister(bcontainer);
     if (vioc->release) {
         vioc->release(bcontainer);

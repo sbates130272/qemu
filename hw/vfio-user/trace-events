@@ -5,6 +5,7 @@
 # container.c
 vfio_user_dma_map(uint64_t iova, uint64_t size, uint64_t off, uint32_t flags, bool async_ops) " iova 0x%"PRIx64" size 0x%"PRIx64" off 0x%"PRIx64" flags 0x%x async_ops %d"
 vfio_user_dma_unmap(uint64_t iova, uint64_t size, uint32_t flags,  bool async_ops) " iova 0x%"PRIx64" size 0x%"PRIx64" flags 0x%x async_ops %d"
+vfio_user_dma_unmap_range(uint64_t iova, uint64_t size, uint64_t req_iova, uint64_t req_size) " mapped iova 0x%"PRIx64" size 0x%"PRIx64" for the unmap of iova 0x%"PRIx64" size 0x%"PRIx64
 
 # peer-mmio.c
 vfio_user_peer_mmio_add(const char *owner, uint64_t iova, uint64_t size, bool readonly) " BAR of %s iova 0x%"PRIx64" size 0x%"PRIx64" readonly %d"
