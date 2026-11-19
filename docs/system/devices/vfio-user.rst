@@ -41,7 +41,9 @@ that device is a QEMU device or another ``vfio-user`` server.
 
 The property is off by default, and applies to the one device it is set on, so
 it acts like a per-device access policy. The device's own BARs, the config
-space (ECAM) and platform MMIO are never announced. The server still needs PCI
+space (ECAM), platform MMIO, and the MSI-X table and pending bit array of the
+other devices are never announced: whoever can write a device's MSI-X table
+chooses where its interrupts go. The server still needs PCI
 Bus Master Enable set on its device for its writes to reach the target, as for
 any DMA.
 

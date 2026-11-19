@@ -10,6 +10,7 @@ vfio_user_dma_unmap_range(uint64_t iova, uint64_t size, uint64_t req_iova, uint6
 # peer-mmio.c
 vfio_user_peer_mmio_add(const char *owner, uint64_t iova, uint64_t size, bool readonly) " BAR of %s iova 0x%"PRIx64" size 0x%"PRIx64" readonly %d"
 vfio_user_peer_mmio_del(uint64_t iova, uint64_t size) " iova 0x%"PRIx64" size 0x%"PRIx64
+vfio_user_peer_mmio_msix(const char *owner, int bar, uint64_t offset, uint64_t size) " not announced, overlaps the MSI-X table or PBA of %s: BAR %d offset 0x%"PRIx64" size 0x%"PRIx64
 
 # device.c
 vfio_user_device_io_device_feature(uint32_t argsz, uint32_t flags) " argsz 0x%x flags 0x%x"

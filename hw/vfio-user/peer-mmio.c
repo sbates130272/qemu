@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 
 #include "hw/pci/pci.h"
+#include "hw/pci/msix.h"
 #include "hw/pci/pci_device.h"
 #include "hw/vfio-user/container.h"
 #include "hw/vfio-user/trace.h"
@@ -81,37 +82,85 @@ static void peer_mmio_commit(MemoryListener *listener)
 }
 
 /*
- * Is @mr, or a region it is nested in, @top?  A BAR is often a container of
- * several regions (registers, an MSI-X table, ...), and the memory core hands
- * the listener the leaf regions of the flat view, so a section has to be tied
- * back to its BAR through the region tree.  The tree is used, and not the BAR's
- * address, because a PCI bus address is not always the address the listener's
- * address space sees (machines with an offset or an alias for the PCI window).
+ * Where @mr is within @top, counted from the start of @top, or false if it is
+ * not nested in it.  A BAR is often a container of several regions (registers,
+ * an MSI-X table, ...), and the memory core hands the listener the leaf regions
+ * of the flat view, so a section has to be tied back to its BAR through the
+ * region tree.  The tree is used, and not the BAR's address, because a PCI bus
+ * address is not always the address the listener's address space sees
+ * (machines with an offset or an alias for the PCI window), and because the
+ * result does not change when the guest moves the BAR.
  */
-static bool peer_mmio_region_in(MemoryRegion *mr, MemoryRegion *top)
+static bool peer_mmio_offset_in(MemoryRegion *mr, MemoryRegion *top,
+                                uint64_t *offset)
 {
-    while (mr) {
+    uint64_t sum = 0;
+
+    while (mr != top) {
         Object *container;
 
-        if (mr == top) {
-            return true;
+        if (!mr) {
+            return false;
         }
+        sum += object_property_get_uint(OBJECT(mr), "addr", &error_abort);
         container = object_property_get_link(OBJECT(mr), "container", NULL);
         mr = container ? MEMORY_REGION(container) : NULL;
+    }
+
+    *offset = sum;
+    return true;
+}
+
+/*
+ * Does [offset, offset + size) of BAR @bar of @pdev overlap its MSI-X table or
+ * its pending bit array?  Their place is in the capability, which the guest
+ * cannot change: a BAR number and an offset into it for each, so the answer
+ * holds wherever the guest puts the BAR.  A device that can write another's
+ * table chooses where its interrupts go.
+ */
+static bool peer_mmio_msix_overlaps(PCIDevice *pdev, int bar, uint64_t offset,
+                                    uint64_t size)
+{
+    const uint8_t *cap;
+    uint64_t entries, start, len;
+    uint32_t loc[2];
+    int i;
+
+    if (!msix_present(pdev)) {
+        return false;
+    }
+
+    cap = pdev->config + pdev->msix_cap;
+    entries = (pci_get_word(cap + PCI_MSIX_FLAGS) & PCI_MSIX_FLAGS_QSIZE) + 1;
+    loc[0] = pci_get_long(cap + PCI_MSIX_TABLE);
+    loc[1] = pci_get_long(cap + PCI_MSIX_PBA);
+
+    for (i = 0; i < 2; i++) {
+        if ((loc[i] & PCI_MSIX_FLAGS_BIRMASK) != bar) {
+            continue;
+        }
+        start = loc[i] & ~PCI_MSIX_FLAGS_BIRMASK;
+        /* 16 bytes per table entry; one bit per entry in the array. */
+        len = i == 0 ? entries * PCI_MSIX_ENTRY_SIZE
+                     : DIV_ROUND_UP(entries, 64) * 8;
+        if (offset < start + len && start < offset + size) {
+            return true;
+        }
     }
 
     return false;
 }
 
 /*
- * The PCI device other than the container's own whose memory BAR @section is
- * part of, or NULL.  Regions a PCI device owns that are not a BAR (the legacy
- * VGA window, a LPC bridge's RCRB) do not qualify.
+ * The PCI device other than the container's own whose memory BAR holds
+ * [offset, offset + size) of @mr, or NULL.  Regions a PCI device owns that are
+ * not a BAR (the legacy VGA window, a LPC bridge's RCRB) do not qualify, and
+ * neither does a range that overlaps the device's MSI-X table or PBA.
  */
-static PCIDevice *peer_mmio_bar_owner(VFIOUserPeerMMIO *peer,
-                                      MemoryRegionSection *section)
+static PCIDevice *peer_mmio_bar_owner(VFIOUserPeerMMIO *peer, MemoryRegion *mr,
+                                      uint64_t offset, uint64_t size)
 {
-    Object *owner = memory_region_owner(section->mr);
+    Object *owner = memory_region_owner(mr);
     PCIDevice *pdev;
     int i;
 
@@ -123,14 +172,19 @@ static PCIDevice *peer_mmio_bar_owner(VFIOUserPeerMMIO *peer,
     pdev = PCI_DEVICE(owner);
     for (i = 0; i < PCI_NUM_REGIONS; i++) {
         PCIIORegion *r = &pdev->io_regions[i];
+        uint64_t in_bar;
 
         if (i == PCI_ROM_SLOT || !r->size || !r->memory ||
-            (r->type & PCI_BASE_ADDRESS_SPACE_IO)) {
+            (r->type & PCI_BASE_ADDRESS_SPACE_IO) ||
+            !peer_mmio_offset_in(mr, r->memory, &in_bar)) {
             continue;
         }
-        if (peer_mmio_region_in(section->mr, r->memory)) {
-            return pdev;
+        if (peer_mmio_msix_overlaps(pdev, i, in_bar + offset, size)) {
+            trace_vfio_user_peer_mmio_msix(pdev->name, i, in_bar + offset,
+                                           size);
+            return NULL;
         }
+        return pdev;
     }
 
     return NULL;
@@ -265,7 +319,7 @@ static void peer_mmio_iommu_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
         return;
     }
 
-    owner = peer_mmio_bar_owner(peer, &target);
+    owner = peer_mmio_bar_owner(peer, target.mr, xlat, size);
     if (owner) {
         peer_mmio_announce(peer, owner, iova, size,
                            !(iotlb->perm & IOMMU_WO), giommu);
@@ -349,7 +403,8 @@ static void peer_mmio_region_add(MemoryListener *listener,
         return;
     }
 
-    owner = peer_mmio_bar_owner(peer, section);
+    owner = peer_mmio_bar_owner(peer, section->mr,
+                                section->offset_within_region, size);
     if (owner) {
         peer_mmio_announce(peer, owner, iova, size, section->readonly, NULL);
     }
